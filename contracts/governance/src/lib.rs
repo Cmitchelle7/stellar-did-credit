@@ -177,7 +177,7 @@ impl Governance {
             .instance()
             .extend_ttl(INSTANCE_BUMP_THRESHOLD, INSTANCE_BUMP_AMOUNT);
 
-        // Issue #302: emit an Initialized event so off-chain indexers can
+        // Issue #665: emit an Initialized event so off-chain indexers can
         // observe governance deployment before the first admin action.
         // Data tuple includes the admin and the credit-oracle target so
         // indexers can record the contract's wiring.
@@ -1008,6 +1008,66 @@ mod tests {
         assert_eq!(active_weights.vc_weight, 50);
         assert_eq!(active_weights.tx_weight, 20);
         assert_eq!(active_weights.repayment_weight, 30);
+    }
+
+    /// Issue #665: `initialize` must emit exactly one `Initialized` event
+    /// carrying the admin and credit-oracle addresses so off-chain indexers
+    /// can observe governance deployments before the first admin action, and
+    /// a second initialization must fail without emitting a duplicate event.
+    #[test]
+    fn test_initialize_emits_initialized_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let credit_oracle_id = env.register_contract(None, CreditOracle);
+        CreditOracleClient::new(&env, &credit_oracle_id).initialize(&admin);
+
+        let gov_id = env.register_contract(None, Governance);
+        let gov_client = GovernanceClient::new(&env, &gov_id);
+        gov_client.initialize(&admin, &credit_oracle_id, &500);
+
+        // A second initialize must fail and must not emit another event.
+        let events = env.events().all();
+        let mut gov_events = 0;
+        let mut found_initialized = false;
+        for (contract_id, topics, data) in events.iter() {
+            if contract_id != gov_id {
+                continue;
+            }
+            gov_events += 1;
+            if topics.len() == 1 {
+                let evt_topic: soroban_sdk::Symbol = topics
+                    .get(0)
+                    .unwrap()
+                    .try_into_val(&env)
+                    .unwrap_or(soroban_sdk::symbol_short!("invalid"));
+                if evt_topic == Symbol::new(&env, "Initialized") {
+                    found_initialized = true;
+                    let payload: (Address, Address) = data.try_into_val(&env).unwrap();
+                    assert_eq!(
+                        payload.0, admin,
+                        "governance Initialized event admin mismatch"
+                    );
+                    assert_eq!(
+                        payload.1, credit_oracle_id,
+                        "governance Initialized event credit_oracle mismatch"
+                    );
+                }
+            }
+        }
+
+        assert_eq!(
+            gov_events, 1,
+            "governance should emit exactly one event on initialize"
+        );
+        assert!(
+            found_initialized,
+            "governance Initialized event should be emitted"
+        );
+
+        let res = gov_client.try_initialize(&admin, &credit_oracle_id, &500);
+        assert_eq!(res, Err(Ok(GovernanceError::AlreadyInitialized)));
     }
 
     #[test]
