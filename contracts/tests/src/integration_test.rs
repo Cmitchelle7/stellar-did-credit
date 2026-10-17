@@ -2361,7 +2361,7 @@ mod tests {
         credit.flag_score_input(&subject, &key_tx, &reason);
         credit.flag_score_input(&subject, &key_repay, &reason);
 
-        let events_before = env.events().all().len();
+        let _ = env.events().all();
 
         credit.resolve_dispute(&subject, &key_tx, &true);
         credit.resolve_dispute(&subject, &key_repay, &false);
@@ -2371,7 +2371,7 @@ mod tests {
         let mut rslv_payloads: Vec<(soroban_sdk::Address, soroban_sdk::Symbol)> = Vec::new();
         let mut rjct_payloads: Vec<(soroban_sdk::Address, soroban_sdk::Symbol)> = Vec::new();
 
-        for i in events_before..events.len() {
+        for i in 0..events.len() {
             let (emitter, topics, data) = events.get(i).unwrap();
             if emitter != credit_id || topics.is_empty() {
                 continue;
