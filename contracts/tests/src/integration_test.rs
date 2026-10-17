@@ -2388,3 +2388,122 @@ mod tests {
         assert_eq!(credit.compute_score(&subject), baseline);
     }
 }
+
+
+    // -----------------------------------------------------------------------
+    // Issue #956: DsptRslv / DsptRjct event payload + independent resolution
+    //
+    // `test_dispute_file_resolve_score_updates` (above) proves the flow
+    // end-to-end and asserts that *one* DsptRslv topic fires. This test
+    // covers what a real feeder consumes and what the existing test does
+    // not exercise:
+    //
+    //   1. The DsptRslv event carries `(subject, input_key)` as its data
+    //      payload — the tuple a feeder matches on to know which input to
+    //      re-fetch and for whom.
+    //   2. Rejecting a dispute emits DsptRjct with the same payload shape,
+    //      and never emits DsptRslv.
+    //   3. Two input keys disputed for the same subject resolve
+    //      independently: accepting one and rejecting the other produces
+    //      exactly one DsptRslv (for the accepted key) and one DsptRjct
+    //      (for the rejected one), with matching payloads.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_dispute_resolve_and_reject_emit_correctly_payloaded_events() {
+        use soroban_sdk::{symbol_short, IntoVal, TryIntoVal};
+
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let credit_id = env.register_contract(None, CreditOracle);
+        let credit = CreditOracleClient::new(&env, &credit_id);
+
+        let admin = soroban_sdk::Address::generate(&env);
+        let feeder = soroban_sdk::Address::generate(&env);
+        let lender = soroban_sdk::Address::generate(&env);
+        let subject = soroban_sdk::Address::generate(&env);
+
+        credit.initialize(&admin);
+        credit.register_feeder(&admin, &feeder);
+        credit.register_lender(&admin, &lender);
+
+        // Baseline data so the score is well-formed.
+        credit.update_tx_stats(
+            &feeder,
+            &subject,
+            &TxStats {
+                volume_30d: 500_000_000i128,
+                tx_count_30d: 5,
+                avg_counterparties: 2,
+            },
+        );
+        for _ in 0..5 {
+            credit.record_repayment(&lender, &subject, &100_000_000i128, &true);
+        }
+        let _ = credit.compute_score(&subject);
+
+        // Two independent disputes on the same subject.
+        let key_tx = soroban_sdk::Symbol::new(&env, "tx_stats");
+        let key_repay = soroban_sdk::Symbol::new(&env, "repayment");
+        let reason = soroban_sdk::String::from_str(&env, "disputed input");
+
+        credit.flag_score_input(&subject, &key_tx, &reason);
+        credit.flag_score_input(&subject, &key_repay, &reason);
+
+        // Capture the ledger boundary before either resolution so the
+        // assertion only looks at events emitted by the two calls below.
+        let events_before = env.events().all().len();
+
+        // Accept tx_stats, reject repayment.
+        credit.resolve_dispute(&subject, &key_tx, &true);
+        credit.resolve_dispute(&subject, &key_repay, &false);
+
+        // -- Assert on the events produced by the two resolve calls ---------
+        let events = env.events().all();
+
+        let mut rslv_payloads: Vec<(soroban_sdk::Address, soroban_sdk::Symbol)> = Vec::new(&env);
+        let mut rjct_payloads: Vec<(soroban_sdk::Address, soroban_sdk::Symbol)> = Vec::new(&env);
+
+        for i in events_before..events.len() {
+            let (emitter, topics, data) = events.get(i).unwrap();
+            if emitter != credit_id || topics.is_empty() {
+                continue;
+            }
+            let topic0: Result<soroban_sdk::Symbol, _> =
+                topics.get(0).unwrap().try_into_val(&env);
+            let topic0 = match topic0 {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+
+            if topic0 == symbol_short!("DsptRslv") {
+                let payload: (soroban_sdk::Address, soroban_sdk::Symbol) = data
+                    .try_into_val(&env)
+                    .expect("DsptRslv data must be (Address, Symbol)");
+                rslv_payloads.push_back(payload);
+            } else if topic0 == symbol_short!("DsptRjct") {
+                let payload: (soroban_sdk::Address, soroban_sdk::Symbol) = data
+                    .try_into_val(&env)
+                    .expect("DsptRjct data must be (Address, Symbol)");
+                rjct_payloads.push_back(payload);
+            }
+        }
+
+        // Exactly one of each, with the payloads a feeder would match on.
+        assert_eq!(rslv_payloads.len(), 1, "expected exactly one DsptRslv");
+        assert_eq!(rjct_payloads.len(), 1, "expected exactly one DsptRjct");
+
+        let (rslv_subject, rslv_key) = rslv_payloads.get(0).unwrap();
+        assert_eq!(rslv_subject, subject, "DsptRslv subject mismatch");
+        assert_eq!(rslv_key, key_tx, "DsptRslv input_key must be tx_stats");
+
+        let (rjct_subject, rjct_key) = rjct_payloads.get(0).unwrap();
+        assert_eq!(rjct_subject, subject, "DsptRjct subject mismatch");
+        assert_eq!(rjct_key, key_repay, "DsptRjct input_key must be repayment");
+
+        // On-chain state reflects the two independent resolutions.
+        let tx_dispute = credit.get_dispute(&subject, &key_tx).unwrap();
+        assert_eq!(tx_dispute.status, DisputeStatus::Resolved);
+        let repay_dispute = credit.get_dispute(&subject, &key_repay).unwrap();
+        assert_eq!(repay_dispute.status, DisputeStatus::Rejected);
+    }
