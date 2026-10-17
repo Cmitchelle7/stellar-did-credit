@@ -3601,6 +3601,52 @@ describe("batchRevokeVC", () => {
     ).toHaveLength(2);
   });
 
+  it("sends all hashes in a single batch_revoke call when get_batch_limit is unavailable", async () => {
+    // When the contract's `get_batch_limit` read fails (or the contract has no
+    // BatchLimit set), `batchRevokeVC` sends everything in one `batch_revoke`
+    // call. Unlike `batchAnchorVCs` — which uses the compile-time
+    // BATCH_ANCHOR_MAX_SIZE for its own chunking — `batchRevokeVC` relies
+    // exclusively on the contract-configured limit. Without a limit the
+    // fallback is a single call; the contract itself enforces `MAX_BATCH_SIZE`
+    // (see `contracts/revocation-registry/src/lib.rs`), so an oversized batch
+    // fails at the contract layer with `BatchTooLarge`.
+    //
+    // This test pins that documented behavior. If a future change ever starts
+    // chunking the fallback at BATCH_ANCHOR_MAX_SIZE, this assertion will fail
+    // and must be updated alongside the implementation.
+    const vcHashes = Array.from({ length: 25 }, (_, i) =>
+      Buffer.alloc(32, i + 1),
+    );
+
+    // First simulate call is the get_batch_limit read -> fail so the SDK
+    // exercises the fallback path.
+    mockSimulateTransaction
+      .mockResolvedValueOnce({ error: "not implemented" })
+      .mockResolvedValue({ result: {} });
+
+    const sdk = new StellarDIDCreditSDK(mockConfig);
+    const result: BatchResult = await sdk.batchRevokeVC(
+      issuerKeypair as never,
+      vcHashes,
+    );
+
+    // Exactly one batch_revoke call — no fallback chunking.
+    expect(result.results).toHaveLength(1);
+    const batchCalls = mockContractCalls.filter(
+      (call) => call.method === "batch_revoke",
+    );
+    expect(batchCalls).toHaveLength(1);
+
+    // And that single call carries ALL hashes, not a truncated batch.
+    const arg = batchCalls[0]?.args[1] as
+      | { value?: Buffer[] }
+      | Buffer[]
+      | undefined;
+    const sentHashes = Array.isArray(arg) ? arg : (arg?.value ?? []);
+    expect(sentHashes).toHaveLength(vcHashes.length);
+
+    expect(mockSendTransaction).toHaveBeenCalledTimes(1);
+  });
   it("chunks 100 hashes into two sequential transactions of 50 hashes each", async () => {
     const vcHashes = Array.from({ length: 100 }, (_, i) =>
       Buffer.alloc(32, i + 1),
