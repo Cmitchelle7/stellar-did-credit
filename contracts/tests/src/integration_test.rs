@@ -942,7 +942,7 @@ mod tests {
         gov.cancel_proposal(&proposer, &proposal_id);
 
         // Capture events immediately after cancel_proposal, before any other call drains them.
-        // env.events().all() is a draining operation — any subsequent client call will
+        // env.events().all() is a draining operation - any subsequent client call will
         // clear the buffer, so we must read it before get_proposal.
         let events = env.events().all();
 
@@ -1165,15 +1165,15 @@ mod tests {
     }
 
     /// Integration test for governance execution timelock:
-    /// vote passes → advance past voting → execution rejected (timelock) →
-    /// advance past delay → execution succeeds.
+    /// vote passes  advance past voting  execution rejected (timelock) 
+    /// advance past delay  execution succeeds.
     ///
-    /// This follows the double-timelock model from docs/governance.md §2.2:
+    /// This follows the double-timelock model from docs/governance.md 2.2:
     /// `execute()` only queues weights in the credit-oracle via
     /// `propose_weights()` (starting the fixed 17,280-ledger timelock); the
     /// weights do NOT become active until `apply_weights()` is called after
     /// that timelock expires. This test therefore:
-    ///   1. execute() → active weights unchanged (still default)
+    ///   1. execute()  active weights unchanged (still default)
     ///   2. advance 17,282 ledgers and bump instance TTL on both contracts
     ///   3. apply_weights()
     ///   4. verify active weights now equal the proposal's values.
@@ -1220,7 +1220,7 @@ mod tests {
             l.sequence_number += 101;
         });
 
-        // Execution must fail — timelock not yet expired
+        // Execution must fail - timelock not yet expired
         let res = gov.try_execute(&proposal_id);
         assert_eq!(
             res,
@@ -1423,7 +1423,7 @@ mod tests {
         let after_dereg = identity.list_issuers();
         assert_eq!(after_dereg.len(), 0);
 
-        // Re-register — should not create a duplicate entry in the compacted index
+        // Re-register - should not create a duplicate entry in the compacted index
         identity.register_issuer(&issuer);
         let after_rereg = identity.list_issuers();
         assert_eq!(after_rereg.len(), 1);
@@ -1513,7 +1513,7 @@ mod tests {
         env.ledger()
             .set_sequence_number(env.ledger().sequence() + 1);
 
-        // Compute score again for same subject — should NOT double count
+        // Compute score again for same subject - should NOT double count
         credit.compute_score(&subject);
         let stats3 = credit.get_protocol_stats();
         assert_eq!(stats3.total_subjects_scored, 1);
@@ -1630,7 +1630,7 @@ mod tests {
             score_after_reactivation
         );
 
-        // 7. Anchor a new VC — subject becomes verified again
+        // 7. Anchor a new VC - subject becomes verified again
         let vc_hash3 = BytesN::from_array(&env, &[3u8; 32]);
         identity.anchor_vc(&issuer, &subject, &vc_hash3);
         assert!(identity.is_verified(&subject));
@@ -1825,7 +1825,7 @@ mod tests {
         assert_eq!(rec1_v2_updated.total_repaid, 5000);
     }
 
-    // ── Compute-score cooldown tests ──────────────────────────────────────
+    // -- Compute-score cooldown tests --------------------------------------
 
     /// cooldown = 1 (default): second call within the same ledger is rejected.
     #[test]
@@ -1907,7 +1907,7 @@ mod tests {
         env.ledger()
             .set_sequence_number(env.ledger().sequence() + 1);
 
-        // Second computation — write occurs because VC count changed
+        // Second computation - write occurs because VC count changed
         credit.compute_score(&subject);
         let record2 = credit.get_score(&subject).unwrap();
         assert_eq!(
@@ -2028,10 +2028,10 @@ mod tests {
         assert!(!identity.verify_vc(&subject, &vc_hash));
     }
 
-    /// Full flow: file dispute → admin resolves → feeder re-syncs → score updates.
+    /// Full flow: file dispute  admin resolves  feeder re-syncs  score updates.
     ///
     /// Covers acceptance criteria for issue #244:
-    /// file dispute → admin resolves → score updates.
+    /// file dispute  admin resolves  score updates.
     #[test]
     fn test_dispute_file_resolve_score_updates() {
         let env = Env::default();
@@ -2399,7 +2399,7 @@ mod tests {
     // not exercise:
     //
     //   1. The DsptRslv event carries `(subject, input_key)` as its data
-    //      payload � the tuple a feeder matches on to know which input to
+    //      payload  the tuple a feeder matches on to know which input to
     //      re-fetch and for whom.
     //   2. Rejecting a dispute emits DsptRjct with the same payload shape,
     //      and never emits DsptRslv.
