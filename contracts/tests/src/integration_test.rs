@@ -2255,6 +2255,266 @@ mod tests {
         );
     }
 
+    /// Dispute events (topic, subject, input_key) published by the credit
+    /// oracle during the most recent contract call.
+    ///
+    /// `env.events().all()` drains the buffer, so call this immediately after
+    /// the client call under test, before any other client call.
+    fn dispute_events(env: &Env, credit_id: &Address) -> Vec<(Symbol, Address, Symbol)> {
+        let dispute_topics = [
+            symbol_short!("DsptFild"),
+            symbol_short!("DsptRslv"),
+            symbol_short!("DsptRjct"),
+        ];
+        let mut out = Vec::new();
+        for (id, topics, data) in env.events().all().iter() {
+            if id != *credit_id || topics.len() != 1 {
+                continue;
+            }
+            let topic: Symbol = match topics.get(0).unwrap().try_into_val(env) {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            if !dispute_topics.contains(&topic) {
+                continue;
+            }
+            let (subject, input_key): (Address, Symbol) = data.try_into_val(env).unwrap();
+            out.push((topic, subject, input_key));
+        }
+        out
+    }
+
+    /// Issue #956: dispute -> feeder resync, with every dispute event verified
+    /// by topic AND payload rather than merely counted.
+    ///
+    /// 1. subject flags tx_stats     -> exactly one DsptFild(subject, tx_stats)
+    /// 2. admin accepts the dispute  -> exactly one DsptRslv(subject, tx_stats),
+    ///    and no DsptRjct
+    /// 3. the feeder reads which input to re-fetch from the DsptRslv payload,
+    ///    resubmits corrected stats, and the recomputed score drops.
+    #[test]
+    fn test_dispute_accepted_events_drive_feeder_resync() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let credit_id = env.register(CreditOracle, ());
+        let credit = CreditOracleClient::new(&env, &credit_id);
+
+        let admin = soroban_sdk::Address::generate(&env);
+        let feeder = soroban_sdk::Address::generate(&env);
+        let lender = soroban_sdk::Address::generate(&env);
+        let subject = soroban_sdk::Address::generate(&env);
+
+        credit.initialize(&admin);
+        credit.register_feeder(&admin, &feeder);
+        credit.register_lender(&admin, &lender);
+
+        // Feeder submits inflated stats; score is computed from them.
+        credit.update_tx_stats(
+            &feeder,
+            &subject,
+            &TxStats {
+                volume_30d: 100_000_000_000i128,
+                tx_count_30d: 500,
+                avg_counterparties: 50,
+            },
+        );
+        for _ in 0..5 {
+            credit.record_repayment(&lender, &subject, &100_000_000i128, &true);
+        }
+        let inflated_score = credit.compute_score(&subject);
+        assert!(inflated_score > 300, "expected score > 300, got {}", inflated_score);
+
+        // Step 1: subject flags tx_stats; exactly one DsptFild with the right payload.
+        let input_key = Symbol::new(&env, "tx_stats");
+        let reason = String::from_str(&env, "30d volume is far lower than reported");
+        credit.flag_score_input(&subject, &input_key, &reason);
+        assert_eq!(
+            dispute_events(&env, &credit_id),
+            vec![(symbol_short!("DsptFild"), subject.clone(), input_key.clone())],
+            "flag_score_input must emit exactly one DsptFild(subject, input_key)"
+        );
+        assert_eq!(
+            credit.get_dispute(&subject, &input_key).unwrap().status,
+            DisputeStatus::Pending
+        );
+
+        // Step 2: admin accepts; exactly one DsptRslv and no DsptRjct.
+        credit.resolve_dispute(&subject, &input_key, &true);
+        let resolve_events = dispute_events(&env, &credit_id);
+        assert_eq!(
+            resolve_events,
+            vec![(symbol_short!("DsptRslv"), subject.clone(), input_key.clone())],
+            "accepting a dispute must emit exactly one DsptRslv(subject, input_key)"
+        );
+        assert_eq!(
+            credit.get_dispute(&subject, &input_key).unwrap().status,
+            DisputeStatus::Resolved
+        );
+
+        // Step 3: the feeder takes the input to re-fetch from the event payload.
+        let (_, event_subject, event_key) = resolve_events[0].clone();
+        assert_eq!(event_key, Symbol::new(&env, "tx_stats"));
+        credit.update_tx_stats(
+            &feeder,
+            &event_subject,
+            &TxStats {
+                volume_30d: 500_000_000i128,
+                tx_count_30d: 5,
+                avg_counterparties: 2,
+            },
+        );
+
+        env.ledger().set_sequence_number(env.ledger().sequence() + 1);
+        let corrected_score = credit.compute_score(&subject);
+        assert!(
+            corrected_score < inflated_score,
+            "score after resync ({}) must be below the inflated score ({})",
+            corrected_score,
+            inflated_score
+        );
+        assert!(
+            (300..=850).contains(&corrected_score),
+            "score must stay within 300..=850, got {}",
+            corrected_score
+        );
+    }
+
+    /// Issue #956: a REJECTED dispute emits DsptRjct (not DsptRslv), so the
+    /// feeder has nothing to resync and the score is unchanged.
+    #[test]
+    fn test_dispute_rejected_emits_dsptrjct_and_score_unchanged() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let credit_id = env.register(CreditOracle, ());
+        let credit = CreditOracleClient::new(&env, &credit_id);
+
+        let admin = soroban_sdk::Address::generate(&env);
+        let feeder = soroban_sdk::Address::generate(&env);
+        let lender = soroban_sdk::Address::generate(&env);
+        let subject = soroban_sdk::Address::generate(&env);
+
+        credit.initialize(&admin);
+        credit.register_feeder(&admin, &feeder);
+        credit.register_lender(&admin, &lender);
+
+        credit.update_tx_stats(
+            &feeder,
+            &subject,
+            &TxStats {
+                volume_30d: 500_000_000i128,
+                tx_count_30d: 5,
+                avg_counterparties: 2,
+            },
+        );
+        for _ in 0..3 {
+            credit.record_repayment(&lender, &subject, &100_000_000i128, &true);
+        }
+        let score_before = credit.compute_score(&subject);
+
+        let input_key = Symbol::new(&env, "tx_stats");
+        let reason = String::from_str(&env, "I think this is too low");
+        credit.flag_score_input(&subject, &input_key, &reason);
+        assert_eq!(
+            dispute_events(&env, &credit_id),
+            vec![(symbol_short!("DsptFild"), subject.clone(), input_key.clone())]
+        );
+
+        // Admin rejects: exactly one DsptRjct, and no DsptRslv for the feeder to act on.
+        credit.resolve_dispute(&subject, &input_key, &false);
+        assert_eq!(
+            dispute_events(&env, &credit_id),
+            vec![(symbol_short!("DsptRjct"), subject.clone(), input_key.clone())],
+            "rejecting a dispute must emit exactly one DsptRjct and no DsptRslv"
+        );
+        assert_eq!(
+            credit.get_dispute(&subject, &input_key).unwrap().status,
+            DisputeStatus::Rejected
+        );
+
+        // No resync happened, so recomputing yields the same score.
+        env.ledger().set_sequence_number(env.ledger().sequence() + 1);
+        assert_eq!(credit.compute_score(&subject), score_before);
+
+        // A rejected dispute does not block filing a new one for the same key.
+        credit.flag_score_input(&subject, &input_key, &reason);
+        assert_eq!(
+            dispute_events(&env, &credit_id),
+            vec![(symbol_short!("DsptFild"), subject.clone(), input_key.clone())]
+        );
+        assert_eq!(
+            credit.get_dispute(&subject, &input_key).unwrap().status,
+            DisputeStatus::Pending
+        );
+    }
+
+    /// Issue #956: disputes on different input keys resolve independently;
+    /// each resolution emits an event for its own key only.
+    #[test]
+    fn test_dispute_keys_resolve_independently() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let credit_id = env.register(CreditOracle, ());
+        let credit = CreditOracleClient::new(&env, &credit_id);
+
+        let admin = soroban_sdk::Address::generate(&env);
+        let subject = soroban_sdk::Address::generate(&env);
+        credit.initialize(&admin);
+
+        let tx_key = Symbol::new(&env, "tx_stats");
+        let repay_key = Symbol::new(&env, "repayment");
+        let reason = String::from_str(&env, "input looks wrong");
+
+        credit.flag_score_input(&subject, &tx_key, &reason);
+        assert_eq!(
+            dispute_events(&env, &credit_id),
+            vec![(symbol_short!("DsptFild"), subject.clone(), tx_key.clone())]
+        );
+        credit.flag_score_input(&subject, &repay_key, &reason);
+        assert_eq!(
+            dispute_events(&env, &credit_id),
+            vec![(symbol_short!("DsptFild"), subject.clone(), repay_key.clone())]
+        );
+
+        // Accept tx_stats only: the event names tx_stats, repayment stays Pending.
+        credit.resolve_dispute(&subject, &tx_key, &true);
+        assert_eq!(
+            dispute_events(&env, &credit_id),
+            vec![(symbol_short!("DsptRslv"), subject.clone(), tx_key.clone())]
+        );
+        assert_eq!(
+            credit.get_dispute(&subject, &tx_key).unwrap().status,
+            DisputeStatus::Resolved
+        );
+        assert_eq!(
+            credit.get_dispute(&subject, &repay_key).unwrap().status,
+            DisputeStatus::Pending
+        );
+        assert_eq!(
+            credit.try_flag_score_input(&subject, &repay_key, &reason),
+            Err(Ok(CreditOracleError::DisputeAlreadyPending)),
+            "the still-pending repayment dispute must keep blocking re-filing"
+        );
+
+        // Reject repayment: DsptRjct names repayment only.
+        credit.resolve_dispute(&subject, &repay_key, &false);
+        assert_eq!(
+            dispute_events(&env, &credit_id),
+            vec![(symbol_short!("DsptRjct"), subject.clone(), repay_key.clone())]
+        );
+        assert_eq!(
+            credit.get_dispute(&subject, &tx_key).unwrap().status,
+            DisputeStatus::Resolved
+        );
+        assert_eq!(
+            credit.get_dispute(&subject, &repay_key).unwrap().status,
+            DisputeStatus::Rejected
+        );
+        assert_eq!(credit.list_disputes(&subject).len(), 2);
+    }
+
     /// Subjects cannot file a dispute for an unrecognised input key.
     #[test]
     fn test_dispute_invalid_input_key_rejected_integration() {
