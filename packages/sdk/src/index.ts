@@ -112,6 +112,55 @@ export interface ProtocolConfig {
 
 export type Unsubscribe = () => void;
 
+/** Credit-oracle event topics of the dispute lifecycle. */
+export type DisputeEventType = "DsptFild" | "DsptRslv" | "DsptRjct";
+
+/** `DisputeStatus` stored by the credit-oracle once a dispute event fires. */
+export type DisputeStatus = "Pending" | "Resolved" | "Rejected";
+
+/**
+ * A score event emitted by the credit-oracle on every successful
+ * `compute_score` call, as delivered by
+ * {@link StellarDIDCreditSDK.subscribeToScoreEvents}.
+ */
+export interface ScoreEvent {
+  /** Subject address whose credit score was computed. */
+  subject: string;
+  /** Computed credit score (300–850). */
+  score: number;
+  /** Ledger sequence number at which the score was computed. */
+  ledger: number;
+  /** Unix timestamp (seconds) of the ledger close. */
+  timestamp: number;
+}
+
+/**
+ * A dispute-lifecycle event read from the credit-oracle, as delivered by
+ * {@link StellarDIDCreditSDK.subscribeToDisputeEvents}.
+ */
+export interface DisputeEvent {
+  /** Lifecycle transition: DsptFild, DsptRslv or DsptRjct. */
+  eventType: DisputeEventType;
+  /** Subject address the dispute was filed against. */
+  subject: string;
+  /** Score input the dispute names: tx_stats, repayment or vc_count. */
+  inputKey: string;
+  /** Status implied by {@link eventType}. */
+  status: DisputeStatus;
+}
+
+const DISPUTE_EVENT_STATUS: Record<DisputeEventType, DisputeStatus> = {
+  DsptFild: "Pending",
+  DsptRslv: "Resolved",
+  DsptRjct: "Rejected",
+};
+
+const DISPUTE_EVENT_TOPICS: DisputeEventType[] = [
+  "DsptFild",
+  "DsptRslv",
+  "DsptRjct",
+];
+
 export type SDKErrorCode =
   | "INVALID_VC_HASH"
   | "MISSING_REVOCATION_REGISTRY"
@@ -200,6 +249,7 @@ const CREDIT_ORACLE_ERROR_CODES: Record<number, string> = {
   15: "NoPendingWeights",
   16: "NotInitialized",
   17: "InvalidAmount",
+  18: "InvalidComputeCooldown",
 };
 
 const REVOCATION_REGISTRY_ERROR_CODES: Record<number, string> = {
@@ -228,6 +278,9 @@ const GOVERNANCE_ERROR_CODES: Record<number, string> = {
   12: "VoterNotRegistered",
   13: "InsufficientVoteWeight",
   14: "ProposalAlreadyCancelled",
+  15: "NoPendingWeights",
+  16: "ContractPaused",
+  17: "VoteTallyOverflow",
   18: "ProposalRejected",
   19: "InvalidVotingPeriod",
 };
@@ -477,7 +530,7 @@ export class GovernanceClient {
     weight: bigint,
   ): Promise<string> {
     const publicKey = getPublicKey(adminKeypair);
-    const contract = new Contract(this.config.governanceId);
+    const contract = this.governanceContract();
     const accountData = await this.server.getAccount(publicKey);
     const sourceAccount = new Account(publicKey, accountData.sequenceNumber());
 
@@ -542,7 +595,7 @@ export class GovernanceClient {
     weight: bigint,
   ): Promise<string> {
     const publicKey = getPublicKey(adminKeypair);
-    const contract = new Contract(this.config.governanceId);
+    const contract = this.governanceContract();
     const accountData = await this.server.getAccount(publicKey);
     const sourceAccount = new Account(publicKey, accountData.sequenceNumber());
 
@@ -605,7 +658,7 @@ export class GovernanceClient {
     quorum: bigint,
   ): Promise<string> {
     const publicKey = getPublicKey(adminKeypair);
-    const contract = new Contract(this.config.governanceId);
+    const contract = this.governanceContract();
     const accountData = await this.server.getAccount(publicKey);
     const sourceAccount = new Account(publicKey, accountData.sequenceNumber());
 
@@ -779,28 +832,142 @@ export class GovernanceClient {
   }
 
   /**
-   * Fetch proposals by scanning the contract's monotonically increasing IDs.
-   * Proposal IDs start at 1; pass `1` or `1n` as `fromId` to include the first
-   * proposal.
+   * Read `NextProposalId` counter from the governance contract's instance storage.
    *
-   * The governance contract exposes `get_proposal`, but no list endpoint, so
-   * this helper performs up to `limit` read-only RPC simulations starting at
-   * `fromId` and omits IDs that no longer have stored proposals.
-   * Proposal execution state does not imply active weights until the
-   * credit-oracle timelock has elapsed and `applyWeights` succeeds.
+   * @returns The next proposal ID as a `bigint`, or `1n` if uninitialized / not found.
+   */
+  async getNextProposalId(): Promise<bigint> {
+    if (!this.config.governanceId?.trim()) {
+      throw new Error("governanceId is required to use the governance client");
+    }
+
+    try {
+      const contract = this.governanceContract();
+      const address =
+        typeof contract.address === "function"
+          ? contract.address()
+          : new Address(this.config.governanceId);
+      const scAddress =
+        typeof address.toScAddress === "function"
+          ? address.toScAddress()
+          : address.toScVal();
+
+      if (
+        typeof this.server.getLedgerEntries === "function" &&
+        xdr?.LedgerKey?.contractData &&
+        xdr?.LedgerKeyContractData &&
+        xdr?.ScVal?.scvLedgerKeyContractInstance &&
+        xdr?.ContractDataDurability?.persistent
+      ) {
+        const ledgerKey = xdr.LedgerKey.contractData(
+          new xdr.LedgerKeyContractData({
+            contract: scAddress as unknown as xdr.ScAddress,
+            key: xdr.ScVal.scvLedgerKeyContractInstance(),
+            durability: xdr.ContractDataDurability.persistent(),
+          }),
+        );
+        const response = await this.server.getLedgerEntries(ledgerKey);
+        if (response && response.entries && response.entries.length > 0) {
+          const entry = response.entries[0] as unknown as { val: unknown };
+          const entryVal = entry.val as Record<string, unknown>;
+          const contractData =
+            typeof entryVal.contractData === "function"
+              ? (entryVal.contractData as () => unknown)()
+              : entryVal.contractData;
+          const contractDataRecord = contractData as Record<string, unknown>;
+          const instanceVal =
+            typeof contractDataRecord?.val === "function"
+              ? (contractDataRecord.val as () => unknown)()
+              : contractDataRecord?.val;
+          const instanceRecord = instanceVal as Record<string, unknown>;
+          const instance =
+            typeof instanceRecord?.instance === "function"
+              ? (instanceRecord.instance as () => unknown)()
+              : instanceVal;
+          const instRec = instance as Record<string, unknown>;
+          const storage =
+            typeof instRec?.storage === "function"
+              ? (instRec.storage as () => unknown)()
+              : instRec?.storage;
+          if (Array.isArray(storage)) {
+            for (const mapEntry of storage) {
+              const mapEntryRecord = mapEntry as Record<string, unknown>;
+              const keyScVal =
+                typeof mapEntryRecord.key === "function"
+                  ? (mapEntryRecord.key as () => unknown)()
+                  : mapEntryRecord.key;
+              const valScVal =
+                typeof mapEntryRecord.val === "function"
+                  ? (mapEntryRecord.val as () => unknown)()
+                  : mapEntryRecord.val;
+              const nativeKey = scValToNative(keyScVal as xdr.ScVal);
+              if (
+                nativeKey === "NextProposalId" ||
+                (Array.isArray(nativeKey) && nativeKey[0] === "NextProposalId") ||
+                (typeof nativeKey === "object" &&
+                  nativeKey !== null &&
+                  "NextProposalId" in nativeKey)
+              ) {
+                return BigInt(
+                  scValToNative(valScVal as xdr.ScVal) as bigint | number | string,
+                );
+              }
+            }
+          }
+        }
+      }
+    } catch {
+      // Fallback if ledger entry query is unsupported or fails
+    }
+
+    return 1n;
+  }
+
+  /**
+   * Fetch proposals by scanning the contract's monotonically increasing IDs.
+   *
+   * Reads `NextProposalId` from contract instance storage and iterates proposals
+   * starting from `from` (default: 1n) up to `min(NextProposalId, from + limit)`.
+   * When called without arguments, enumerates all proposals on-chain.
+   *
+   * Note: Gas and compute cost scales linearly with proposal count as each proposal
+   * is retrieved via read-only simulation.
+   *
+   * @param from - Optional starting proposal ID (inclusive, default: 1n)
+   * @param limit - Optional maximum number of proposals to fetch
+   * @returns Array of fetched `GovernanceProposal` records
    */
   async listProposals(
-    fromId: GovernanceInteger,
-    limit: number,
+    from?: GovernanceInteger,
+    limit?: number,
   ): Promise<GovernanceProposal[]> {
-    if (!Number.isInteger(limit) || limit < 0) {
+    if (limit !== undefined && (!Number.isInteger(limit) || limit < 0)) {
       throw new Error("limit must be a non-negative integer");
     }
 
-    const firstId = toUnsignedBigInt(fromId);
+    if (limit === 0) {
+      return [];
+    }
+
+    const startId = from !== undefined ? toUnsignedBigInt(from) : 1n;
+    const nextProposalId = await this.getNextProposalId();
+
+    let endId: bigint;
+    if (limit !== undefined) {
+      const targetEnd = startId + BigInt(limit);
+      endId =
+        nextProposalId > startId
+          ? targetEnd < nextProposalId
+            ? targetEnd
+            : nextProposalId
+          : targetEnd;
+    } else {
+      endId = nextProposalId > startId ? nextProposalId : startId;
+    }
+
     const proposals: GovernanceProposal[] = [];
-    for (let offset = 0n; offset < BigInt(limit); offset += 1n) {
-      const proposal = await this.getProposal(firstId + offset);
+    for (let id = startId; id < endId; id += 1n) {
+      const proposal = await this.getProposal(id);
       if (proposal) {
         proposals.push(proposal);
       }
@@ -840,7 +1007,7 @@ export class GovernanceClient {
   }
 
   private async submitSignedTransaction(
-    keypair: Keypair,
+    keypair: KeypairLike,
     operation: xdr.Operation,
     operationName: string,
   ): Promise<{ hash: string; retval?: xdr.ScVal }> {
@@ -867,7 +1034,7 @@ export class GovernanceClient {
 
     const retval = sim.result?.retval;
     const preparedTx = SorobanRpc.assembleTransaction(tx, sim).build();
-    preparedTx.sign(keypair);
+    preparedTx.sign(keypair as Keypair);
     const response = await this.server.sendTransaction(preparedTx);
     if (response.status !== "PENDING") {
       throw new Error(
@@ -2040,10 +2207,13 @@ export class StellarDIDCreditSDK {
   }
 
   /**
-   * Fetch a subject's RepaymentRecord from the credit-oracle.
+   * Fetch a subject's repayment record from the credit-oracle.
    *
-   * @param subjectAddress - Stellar G... address of the subject
-   * @returns RepaymentRecord or null if not found
+   * Legacy V1 records contain only the on-time and total counts, so their
+   * cumulative repaid amount is returned as `0n`.
+   *
+   * @param subjectAddress - Stellar address of the subject
+   * @returns The repayment record, or `null` if no record exists
    */
   async getRepaymentRecord(subjectAddress: string): Promise<RepaymentRecord | null> {
     const server = this.server;
@@ -2082,7 +2252,10 @@ export class StellarDIDCreditSDK {
     return {
       onTimeCount: Number(raw["on_time_count"]),
       totalCount: Number(raw["total_count"]),
-      totalRepaid: BigInt(raw["total_repaid"] as bigint),
+      totalRepaid:
+        raw["total_repaid"] === undefined || raw["total_repaid"] === null
+          ? 0n
+          : BigInt(raw["total_repaid"] as bigint),
     };
   }
 
@@ -2122,6 +2295,48 @@ export class StellarDIDCreditSDK {
     }
 
     return parseRecencyDecayConfig(resultScVal);
+  }
+
+  /** Get the current compute-score cooldown in ledgers. */
+  async getComputeCooldownLedgers(): Promise<number> {
+    const server = this.server;
+    const contract = new Contract(this.config.creditOracleId);
+    const tx = new TransactionBuilder(new Account(this.config.simAccount, "0"), {
+      fee: BASE_FEE,
+      networkPassphrase: this.config.networkPassphrase,
+    })
+      .addOperation(contract.call("get_compute_cooldown_ledgers"))
+      .setTimeout(this.config.timeoutSeconds ?? 30)
+      .build();
+    const sim = await server.simulateTransaction(tx);
+    if (SorobanRpc.Api.isSimulationError(sim)) throwContractError(sim.error, "credit-oracle");
+    if (!SorobanRpc.Api.isSimulationSuccess(sim) || !sim.result?.retval) {
+      throw new Error("Simulation returned unexpected response");
+    }
+    return Number(scValToNative(sim.result.retval));
+  }
+
+  /** Set the compute-score cooldown in ledgers. Requires the admin keypair. */
+  async setComputeCooldownLedgers(adminKeypair: KeypairLike, ledgers: number): Promise<string> {
+    const server = this.server;
+    const contract = new Contract(this.config.creditOracleId);
+    const publicKey = getPublicKey(adminKeypair);
+    const accountData = await server.getAccount(publicKey);
+    const tx = new TransactionBuilder(new Account(publicKey, accountData.sequenceNumber()), {
+      fee: BASE_FEE,
+      networkPassphrase: this.config.networkPassphrase,
+    })
+      .addOperation(contract.call("set_compute_cooldown_ledgers", new Address(publicKey).toScVal(), nativeToScVal(ledgers, { type: "u32" })))
+      .setTimeout(this.config.timeoutSeconds ?? 30)
+      .build();
+    const sim = await server.simulateTransaction(tx);
+    if (SorobanRpc.Api.isSimulationError(sim)) throwContractError(sim.error, "credit-oracle");
+    if (!SorobanRpc.Api.isSimulationSuccess(sim)) throw new Error("Simulation returned unexpected response");
+    const preparedTx = SorobanRpc.assembleTransaction(tx, sim).build();
+    preparedTx.sign(adminKeypair as Keypair);
+    const txHash = await sendTransactionWithRetry(server, preparedTx, this.config.maxRetries, (response) => new Error(`Transaction submission failed: ${response.errorResult}`));
+    await waitForTransactionConfirmation(server, txHash, "setComputeCooldownLedgers", getConfirmationTimeoutMs(this.config), getTransactionPollIntervalMs(this.config));
+    return txHash;
   }
 
   /**
@@ -2588,11 +2803,11 @@ export class StellarDIDCreditSDK {
   /**
    * Returns the list of all currently registered (non-deregistered) trusted issuers.
    *
-   * Uses a read-only simulation against the identity-oracle contract.
+   * Calls `list_issuers` on the identity-oracle contract via read-only simulation.
    *
    * @returns Array of Stellar G... addresses of registered issuers
    */
-  async getRegisteredIssuers(): Promise<string[]> {
+  async listIssuers(): Promise<string[]> {
     const server = this.server;
     const contract = new Contract(this.config.identityOracleId);
     const sourceAccount = new Account(this.config.simAccount, "0");
@@ -2622,6 +2837,18 @@ export class StellarDIDCreditSDK {
 
     const native = scValToNative(resultScVal);
     return (native as unknown[]).map((addr) => String(addr));
+  }
+
+  /**
+   * Returns the list of all currently registered (non-deregistered) trusted issuers.
+   *
+   * Uses a read-only simulation against the identity-oracle contract.
+   *
+   * @returns Array of Stellar G... addresses of registered issuers
+   * @alias listIssuers
+   */
+  async getRegisteredIssuers(): Promise<string[]> {
+    return this.listIssuers();
   }
 
   /**
@@ -2705,7 +2932,7 @@ export class StellarDIDCreditSDK {
     const oracleHash = hash(nativeToScVal(this.config.creditOracleId, { type: "address" }).address().toXDR());
     const domainHash = hash(Buffer.from("stellar-did-credit::score-gt-threshold::v1"));
 
-    return ZkWasm.generate_score_proof(
+    const proofBytes: Uint8Array = ZkWasm.generate_score_proof(
       vcPoints,
       Number(txStats.volume30d),
       txStats.avgCounterparties,
@@ -2726,15 +2953,41 @@ export class StellarDIDCreditSDK {
       scoreRecord.computedAtLedger,
       domainHash
     );
+
+    // Append public inputs as a 68-byte trailer so verifyScoreProof can
+    // reconstruct the ScoreRangePublicInputs without extra round-trips:
+    //   [0..32)  score_commitment (SHA-256 of the blinded score fields, 32 bytes)
+    //   [32..36) snapshot_ledger  (u32 big-endian)
+    //   [36..68) domain_separator (32 bytes)
+    const scoreCommitment = hash(Buffer.concat([
+      Buffer.from(new Uint32Array([scoreRecord.score]).buffer).reverse(),
+      Buffer.from(new Uint32Array([scoreRecord.vcCount]).buffer).reverse(),
+      Buffer.from(new BigInt64Array([BigInt(scoreRecord.lastUpdated)]).buffer).reverse(),
+      Buffer.from(new Uint32Array([scoreRecord.computedAtLedger]).buffer).reverse(),
+      Buffer.from(new Uint32Array([blinding]).buffer).reverse(),
+    ]));
+    const snapshotLedgerBuf = Buffer.alloc(4);
+    snapshotLedgerBuf.writeUInt32BE(scoreRecord.computedAtLedger, 0);
+
+    const trailer = Buffer.concat([scoreCommitment, snapshotLedgerBuf, domainHash]);
+    const result = new Uint8Array(proofBytes.length + trailer.length);
+    result.set(proofBytes, 0);
+    result.set(trailer, proofBytes.length);
+    return result;
   }
 
   /**
    * Submits a generated zk-SNARK proof to the on-chain score-range-verifier.
    *
+   * The `proof` parameter must be the value returned by {@link generateScoreProof},
+   * which encodes the raw 384-byte Groth16 proof followed by a 68-byte trailer
+   * containing the public inputs (score_commitment, snapshot_ledger,
+   * domain_separator) needed by the on-chain verifier.
+   *
    * @param payerKeypair - Payer keypair for the transaction
    * @param subjectAddress - Address of the subject being verified
    * @param threshold - The threshold score
-   * @param proof - The proof bytes generated by generateScoreProof
+   * @param proof - The proof bytes returned by generateScoreProof
    * @param verifierContractId - Contract ID of the score-range-verifier
    * @returns true if verified
    */
@@ -2745,6 +2998,30 @@ export class StellarDIDCreditSDK {
     proof: Uint8Array,
     verifierContractId: string
   ): Promise<boolean> {
+    // Split the proof payload produced by generateScoreProof:
+    //   bytes [0..proofLen)   — raw Groth16 proof (everything before the 68-byte trailer)
+    //   bytes [N..N+32)       — score_commitment  (32 bytes)
+    //   bytes [N+32..N+36)    — snapshot_ledger   (u32 big-endian)
+    //   bytes [N+36..N+68)    — domain_separator  (32 bytes)
+    const TRAILER_SIZE = 68;
+    if (proof.length < TRAILER_SIZE) {
+      throw new SDKError("TRANSACTION_FAILED", "Invalid proof payload: too short");
+    }
+    const proofLen = proof.length - TRAILER_SIZE;
+    const rawProof = proof.slice(0, proofLen);
+    const scoreCommitment = proof.slice(proofLen, proofLen + 32);
+    const snapshotLedger = new DataView(proof.buffer, proof.byteOffset + proofLen + 32, 4).getUint32(0, false);
+    const domainSeparator = proof.slice(proofLen + 36, proofLen + 68);
+
+    // Deterministic nonce: SHA-256(proof || subjectAddress || threshold_be)
+    const thresholdBuf = Buffer.alloc(4);
+    thresholdBuf.writeUInt32BE(threshold, 0);
+    const nonce = hash(Buffer.concat([
+      Buffer.from(rawProof),
+      Buffer.from(subjectAddress),
+      thresholdBuf,
+    ]));
+
     const contract = new Contract(verifierContractId);
     const publicKey = getPublicKey(payerKeypair);
 
@@ -2758,9 +3035,20 @@ export class StellarDIDCreditSDK {
       .addOperation(
         contract.call(
           "verify_and_consume",
-          new Address(subjectAddress).toScVal(),
-          nativeToScVal(threshold, { type: "u32" }),
-          nativeToScVal(proof, { type: "bytes" })
+          new Address(publicKey).toScVal(),
+          nativeToScVal(Buffer.from(rawProof), { type: "bytes" }),
+          nativeToScVal(
+            {
+              threshold: threshold,
+              subject: new Address(subjectAddress),
+              credit_oracle_id: new Address(this.config.creditOracleId),
+              score_commitment: scoreCommitment,
+              snapshot_ledger: snapshotLedger,
+              domain_separator: domainSeparator,
+            },
+            { type: "map" }
+          ),
+          nativeToScVal(Buffer.from(nonce), { type: "bytes" }),
         ),
       )
       .setTimeout(this.config.timeoutSeconds ?? 30)
@@ -2849,6 +3137,78 @@ export class StellarDIDCreditSDK {
       const [issuer, vcHash] = parseEventTuple(value, "Revoked", 2);
       callback(String(issuer), toBuffer(vcHash));
     });
+  }
+
+  /**
+   * Poll for the credit-oracle's dispute events (`DsptFild`, `DsptRslv`,
+   * `DsptRjct`) for a single subject.
+   *
+   * A dispute is raised by `flag_score_input` and closed by `resolve_dispute`,
+   * which emits `DsptRslv` when the admin accepts the flag and `DsptRjct` when
+   * they reject it. All three events carry `(subject, input_key)`, so the
+   * subscription filters on `subject` locally and derives `status` from the
+   * event topic. Events from before the subscription started are skipped, and
+   * the three topics share one poll per interval.
+   *
+   * @param subject - Subject address whose disputes to watch
+   * @param callback - Called with each matching {@link DisputeEvent}
+   * @returns A function that stops future polls for this subscription
+   */
+  subscribeToDisputeEvents(
+    subject: string,
+    callback: (event: DisputeEvent) => void,
+  ): Unsubscribe {
+    return this.subscribeToEvents(
+      this.config.creditOracleId,
+      DISPUTE_EVENT_TOPICS,
+      (value, eventName) => {
+        const status = DISPUTE_EVENT_STATUS[eventName as DisputeEventType];
+        if (status === undefined) {
+          return;
+        }
+
+        const [eventSubject, inputKey] = parseEventTuple(value, eventName, 2);
+        if (String(eventSubject) !== subject) {
+          return;
+        }
+
+        callback({
+          eventType: eventName as DisputeEventType,
+          subject: String(eventSubject),
+          inputKey: String(inputKey),
+          status,
+        });
+      },
+    );
+  }
+
+  /**
+   * Subscribe to `Score` events emitted by the credit-oracle contract.
+   *
+   * Polls `getEvents` at the configured `pollIntervalMs` (default 1 000 ms).
+   * The first poll starts at the latest ledger available from the RPC server;
+   * subsequent polls advance past the highest ledger already seen, so no event
+   * is delivered twice.
+   *
+   * @param callback - Called with a {@link ScoreEvent} for every score update
+   * @returns An unsubscribe function — call it to stop future polls
+   */
+  subscribeToScoreEvents(callback: (event: ScoreEvent) => void): Unsubscribe {
+    return this.subscribeToEvents(
+      this.config.creditOracleId,
+      "Score",
+      (value, _eventName, rawEvent) => {
+        const [subject, score] = parseEventTuple(value, "Score", 2);
+        callback({
+          subject: String(subject),
+          score: Number(score),
+          ledger: rawEvent.ledger,
+          timestamp: Math.floor(
+            new Date(rawEvent.ledgerClosedAt).getTime() / 1000,
+          ),
+        });
+      },
+    );
   }
 
   private async submitBatchRevokeChunk(
@@ -3001,9 +3361,14 @@ export class StellarDIDCreditSDK {
 
   private subscribeToEvents(
     contractId: string,
-    eventName: string,
-    handleValue: (value: xdr.ScVal) => void,
+    eventName: string | readonly string[],
+    handleValue: (
+      value: xdr.ScVal,
+      eventName: string,
+      event: SorobanRpc.Api.EventResponse,
+    ) => void,
   ): Unsubscribe {
+    const eventNames = typeof eventName === "string" ? [eventName] : eventName;
     const pollIntervalMs = this.config.pollIntervalMs ?? 1000;
     if (!Number.isFinite(pollIntervalMs) || pollIntervalMs <= 0) {
       throw new Error("pollIntervalMs must be a positive number");
@@ -3036,7 +3401,9 @@ export class StellarDIDCreditSDK {
             {
               type: "contract",
               contractIds: [contractId],
-              topics: [[xdr.ScVal.scvSymbol(eventName).toXDR("base64")]],
+              topics: eventNames.map((name) => [
+                xdr.ScVal.scvSymbol(name).toXDR("base64"),
+              ]),
             },
           ],
           limit: 100,
@@ -3052,7 +3419,7 @@ export class StellarDIDCreditSDK {
           if (!active) {
             break;
           }
-          handleValue(event.value);
+          handleValue(event.value, resolveEventName(event, eventNames), event);
         }
       } catch {
         // Keep polling after transient RPC failures. The ledger cursor is only
@@ -3399,7 +3766,7 @@ function assertSafeInteger(value: GovernanceInteger): void {
   }
 }
 
-function scoringWeightsToScVal(weights: ScoringWeights): xdr.ScVal {
+export function scoringWeightsToScVal(weights: ScoringWeights): xdr.ScVal {
   return nativeToScVal(
     {
       vc_weight: weights.vcWeight,
@@ -3649,6 +4016,27 @@ function parseEventTuple(
     );
   }
   return native;
+}
+
+/**
+ * Names the event a polled record belongs to. A single-topic subscription can
+ * answer without decoding; multi-topic subscriptions read the event topic.
+ */
+function resolveEventName(
+  event: { topic?: xdr.ScVal[] },
+  eventNames: readonly string[],
+): string {
+  if (eventNames.length === 1) {
+    return eventNames[0];
+  }
+
+  const topic = event.topic?.[0];
+  if (topic === undefined) {
+    return "";
+  }
+
+  const decoded = String(scValToNative(topic));
+  return eventNames.includes(decoded) ? decoded : "";
 }
 
 function toBuffer(value: unknown): Buffer {

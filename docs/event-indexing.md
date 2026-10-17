@@ -70,14 +70,16 @@ The `identity-oracle`, `credit-oracle`, and `revocation-registry` contracts emit
 
 - **Topic:** `[Symbol("Revoked")]`
 - **Data:** `(issuer: Address, vc_hash: BytesN<32>)`
-- **Emitted When:** An issuer revokes a single VC hash.
+- **Emitted When:** An issuer revokes a single VC hash, or for each individual VC hash revoked during `batch_revoke`.
+- **Note:** The payload carries no `subject` — the registry stores revocations keyed only by `vc_hash`. The subject forwarded to `revoke` is recorded through the identity-oracle's `mark_vc_revoked`; indexers can resolve per-subject revocations with `IdentityOracle::list_revoked_for_subject(subject)`.
 - **feeder Action:** Map the `vc_hash` to the subject, decrement their VC count, and submit `set_vc_count` to the credit oracle.
 
 #### BatchRev
 
 - **Topic:** `[Symbol("BatchRev")]`
 - **Data:** `(issuer: Address, count: u32)`
-- **Emitted When:** An issuer revokes a batch of VC hashes.
+- **Emitted When:** An issuer revokes a batch of VC hashes via `batch_revoke`. Emitted once at the completion of `batch_revoke` after all per-VC `Revoked` events for the batch have been emitted.
+- **feeder Action:** Optional aggregate tracking or metric collection. Indexers synchronizing credential status rely on the preceding per-VC `Revoked` events emitted for each item in the batch.
 
 ---
 
@@ -132,6 +134,29 @@ The `identity-oracle`, `credit-oracle`, and `revocation-registry` contracts emit
 - **Data:** `(ledgers: u32, admin: Address)`
 - **Emitted When:** The compute cooldown ledgers value is updated by the admin.
 
+#### DsptFild
+
+- **Topic:** `[Symbol("DsptFild")]`
+- **Data:** `(subject: Address, input_key: Symbol)`
+- **Emitted When:** A subject flags one of their score inputs as possibly incorrect via `flag_score_input`. `input_key` is one of `tx_stats`, `repayment`, or `vc_count`, and the stored `DisputeRecord` starts as `Pending`.
+- **feeder Action:** Review the flagged input. Only one pending dispute per `(subject, input_key)` is allowed, so a second `flag_score_input` for the same key fails with `DisputeAlreadyPending`.
+
+#### DsptRslv
+
+- **Topic:** `[Symbol("DsptRslv")]`
+- **Data:** `(subject: Address, input_key: Symbol)`
+- **Emitted When:** The admin accepts the dispute with `resolve_dispute(subject, input_key, true)`, moving the record to `Resolved`.
+- **feeder Action:** Re-fetch and correct the flagged input, then resubmit it (`update_tx_stats`, `record_repayment`, or `set_vc_count`) so the score is recomputed from clean data.
+
+#### DsptRjct
+
+- **Topic:** `[Symbol("DsptRjct")]`
+- **Data:** `(subject: Address, input_key: Symbol)`
+- **Emitted When:** The admin rejects the dispute with `resolve_dispute(subject, input_key, false)`, moving the record to `Rejected`. The flagged input stands, so no re-fetch is needed.
+- **feeder Action:** None. The subject may file a new dispute for the same key afterwards.
+
+`get_dispute(subject, input_key)` and `list_disputes(subject)` return the stored `DisputeRecord` (`subject`, `input_key`, `reason`, `filed_at_ledger`, `status`) for consumers that prefer a storage read over indexing.
+
 ---
 
 ### 4. Governance Events
@@ -160,11 +185,17 @@ The `identity-oracle`, `credit-oracle`, and `revocation-registry` contracts emit
 * **Data:** `canceller: Address`
 * **Emitted When:** A governance proposal is cancelled.
 
+#### WeightsApplied
+
+- **Topic:** `[Symbol("WtApplied")]`
+- **Data:** `ledger_sequence: u32`
+- **Emitted When:** The credit-oracle's pending weights have reached their effective ledger and are successfully applied.
+
 ---
 
 ## Subscribing to Events with the SDK
 
-The TypeScript SDK provides polling helpers for the three events most useful to
+The TypeScript SDK provides polling helpers for the events most useful to
 off-chain lenders, feeders, and analytics services. Each helper polls
 Soroban RPC's `getEvents` method and returns an unsubscribe function. Configure
 the polling interval with `pollIntervalMs`; no WebSocket connection is
@@ -206,10 +237,20 @@ const stopRevoked = sdk.onVCRevoked(
   },
 );
 
+// All three dispute topics for one subject share a single poll per interval.
+const stopDisputes = sdk.subscribeToDisputeEvents(
+  "G...", // Subject address whose disputes to watch
+  (event) => {
+    console.log("Dispute", event);
+    // event: { eventType, subject, inputKey, status }
+  },
+);
+
 // Call the returned functions during shutdown.
 void stopAnchored;
 void stopScored;
 void stopRevoked;
+void stopDisputes;
 ```
 
 The first poll begins at the latest ledger available from the RPC server.
@@ -237,3 +278,10 @@ To maintain a real-time credit score, the off-chain feeder performs the followin
 3. Resolve the `subject` address associated with that `vc_hash` (e.g. from local indexing database).
 4. Call `get_active_vc_count(subject)` on `identity-oracle` via read-only RPC simulation to get the decremented count.
 5. Call `set_vc_count(feeder, subject, count)` on `credit-oracle`.
+
+### Scenario C: Dispute Resolved
+
+1. Subscribe to `DsptFild`, `DsptRslv`, and `DsptRjct` on `credit-oracle` with `sdk.subscribeToDisputeEvents(subject, callback)`.
+2. On a `DsptRslv` event, re-fetch the input named by `inputKey` (`tx_stats`, `repayment`, or `vc_count`) from its source of truth.
+3. Resubmit the corrected value with `update_tx_stats`, `record_repayment`, or `set_vc_count`.
+4. `DsptFild` is informational (an admin still has to rule); `DsptRjct` means the existing input was confirmed correct, so no resubmission is needed.

@@ -9,12 +9,25 @@
  * @packageDocumentation
  */
 
-import { Command } from "commander";
-import { Keypair } from "@stellar/stellar-sdk";
+import { Command, InvalidArgumentError } from "commander";
+import {
+  Account,
+  Address,
+  BASE_FEE,
+  Contract,
+  Keypair,
+  nativeToScVal,
+  scValToNative,
+  SorobanRpc,
+  TransactionBuilder,
+  xdr,
+} from "@stellar/stellar-sdk";
 import {
   StellarDIDCreditSDK,
+  scoringWeightsToScVal,
   type VCRecord,
   type ScoringWeights,
+  type TxStats,
 } from "@stellar-did-credit/sdk";
 import { loadConfig, validateConfig, type NetworkType } from "./config";
 import { readBatchCsv, writeBatchResults, type BatchResult } from "./batch";
@@ -122,6 +135,84 @@ function formatTimestamp(ts: number): string {
 }
 
 /**
+ * Simulates a contract transaction for --dry-run mode without broadcasting.
+ */
+async function simulateDryRun(params: {
+  rpcUrl: string;
+  networkPassphrase: string;
+  sourceKeypair: Keypair;
+  contractId: string;
+  operation: xdr.Operation;
+  label: string;
+}): Promise<void> {
+  const { rpcUrl, networkPassphrase, sourceKeypair, contractId, operation, label } = params;
+  const server = new SorobanRpc.Server(rpcUrl);
+  const publicKey = sourceKeypair.publicKey();
+
+  console.log(`\nSimulating ${label} (--dry-run)...`);
+  console.log(`  Source:   ${publicKey}`);
+  console.log(`  Contract: ${contractId}`);
+
+  try {
+    let sourceAccount: Account;
+    try {
+      const accountData = await server.getAccount(publicKey);
+      sourceAccount = new Account(publicKey, accountData.sequenceNumber());
+    } catch {
+      sourceAccount = new Account(publicKey, "0");
+    }
+
+    const tx = new TransactionBuilder(sourceAccount, {
+      fee: BASE_FEE,
+      networkPassphrase,
+    })
+      .addOperation(operation)
+      .setTimeout(30)
+      .build();
+
+    const sim = await server.simulateTransaction(tx);
+
+    if (SorobanRpc.Api.isSimulationError(sim)) {
+      console.error(`\n❌ Simulation Failed:`);
+      console.error(`  Error: ${sim.error || "Simulation returned error"}`);
+      process.exit(1);
+      return;
+    }
+
+    if (!SorobanRpc.Api.isSimulationSuccess(sim)) {
+      console.error(`\n❌ Simulation Failed:`);
+      console.error(`  Error: Unexpected simulation response`);
+      process.exit(1);
+      return;
+    }
+
+    const gasCost = sim.minResourceFee ? `${sim.minResourceFee} stroops` : "0 stroops";
+    console.log(`\n✅ Simulation Successful (Transaction will succeed without broadcasting)`);
+    console.log(`  Simulated Gas Cost (minResourceFee): ${gasCost}`);
+    if (sim.cost) {
+      console.log(`  CPU Instructions: ${sim.cost.cpuInsns}`);
+      console.log(`  Memory: ${sim.cost.memBytes} bytes`);
+    }
+
+    if (sim.result?.retval) {
+      try {
+        const val = scValToNative(sim.result.retval);
+        console.log(`  Expected Result: ${typeof val === "object" ? JSON.stringify(val) : val}`);
+      } catch {
+        console.log(`  Expected Result: success`);
+      }
+    } else {
+      console.log(`  Expected Result: success (void)`);
+    }
+
+    process.exit(0);
+  } catch (err) {
+    console.error(`\n❌ Simulation Failed:`, err instanceof Error ? err.message : String(err));
+    process.exit(1);
+  }
+}
+
+/**
  * Print a ScoreRecord as a human-readable table to stdout.
  */
 function printScoreRecord(record: {
@@ -181,6 +272,44 @@ function printWeights(weights: ScoringWeights): void {
 }
 
 /**
+ * Print a subject's on-chain TxStats as a human-readable table, in the same
+ * boxed style used by printScoreRecord() for `get-score`.
+ *
+ * `volume30d` is denominated in stroops (the credit-oracle sums XLM volume
+ * on-chain), so it is rendered through formatStroops() like the TX volume
+ * line of the score table.
+ */
+function printTxStats(stats: TxStats): void {
+  // Matches the 37-character inner width used by printScoreRecord()/printWeights().
+  const width = 37;
+
+  const border = (left: string, right: string): string =>
+    `${left}${"─".repeat(width)}${right}`;
+
+  const row = (label: string, value: string): string => {
+    const prefix = `  ${label}:`;
+    const gap = Math.max(1, width - prefix.length - value.length - 1);
+    const trailing = Math.max(0, width - prefix.length - gap - value.length);
+    return `│${prefix}${" ".repeat(gap)}${value}${" ".repeat(trailing)}│`;
+  };
+
+  const titleRow = (title: string): string => {
+    const prefix = `  ${title}`;
+    return `│${prefix}${" ".repeat(Math.max(1, width - prefix.length))}│`;
+  };
+
+  console.log();
+  console.log(border("┌", "┐"));
+  console.log(titleRow("Transaction Statistics"));
+  console.log(border("├", "┤"));
+  console.log(row("Volume (30d)", formatStroops(stats.volume30d)));
+  console.log(row("TX Count (30d)", String(stats.txCount30d)));
+  console.log(row("Avg Counterparties", String(stats.avgCounterparties)));
+  console.log(border("└", "┘"));
+  console.log();
+}
+
+/**
  * Print a list of credential anchors as a readable table.
  */
 function printVCRecords(records: VCRecord[]): void {
@@ -219,13 +348,32 @@ program
   )
   .argument("<subject-secret>", "Stellar secret key of the DID subject (starts with S)")
   .argument("<did-doc-cid>", "IPFS CID of the DID document (e.g. Qm...)")
-  .action(async (subjectSecret: string, didDocCid: string) => {
+  .option("--dry-run", "Simulate transaction execution without broadcasting")
+  .action(async (subjectSecret: string, didDocCid: string, cmdOptions: { dryRun?: boolean }) => {
     const options = program.opts();
     const network = options.network as NetworkType;
     const config = loadConfig(network);
     validateConfig(config, ['identityOracleId']);
     const keypair = parseSecret(subjectSecret);
     const publicKey = keypair.publicKey();
+
+    if (cmdOptions.dryRun) {
+      const contract = new Contract(config.identityOracleId!);
+      const operation = contract.call(
+        "anchor_did",
+        new Address(publicKey).toScVal(),
+        nativeToScVal(didDocCid),
+      );
+      await simulateDryRun({
+        rpcUrl: config.rpcUrl,
+        networkPassphrase: config.networkPassphrase,
+        sourceKeypair: keypair,
+        contractId: config.identityOracleId!,
+        operation,
+        label: "anchor-did",
+      });
+      return;
+    }
 
     const sdk = new StellarDIDCreditSDK(config);
 
@@ -369,19 +517,37 @@ program
   .argument("<payer-secret>", "Stellar secret key of the fee payer (starts with S)")
   .argument("<subject-address>", "Stellar G... address of the subject")
   .option("--json", "Output the full ScoreRecord as JSON")
+  .option("--dry-run", "Simulate transaction execution without broadcasting")
   .action(
     async (
       payerSecret: string,
       subjectAddress: string,
-      options: { json?: boolean },
+      cmdOptions: { json?: boolean; dryRun?: boolean },
     ) => {
       const globalOptions = program.opts();
       const network = globalOptions.network as NetworkType;
       const config = loadConfig(network);
-    validateConfig(config, ['creditOracleId']);
+      validateConfig(config, ['creditOracleId']);
       const keypair = parseSecret(payerSecret);
       const upperAddr = subjectAddress.toUpperCase();
       assertStellarAddress("subject-address", upperAddr);
+
+      if (cmdOptions.dryRun) {
+        const contract = new Contract(config.creditOracleId!);
+        const operation = contract.call(
+          "compute_score",
+          new Address(upperAddr).toScVal(),
+        );
+        await simulateDryRun({
+          rpcUrl: config.rpcUrl,
+          networkPassphrase: config.networkPassphrase,
+          sourceKeypair: keypair,
+          contractId: config.creditOracleId!,
+          operation,
+          label: "compute-score",
+        });
+        return;
+      }
 
       const sdk = new StellarDIDCreditSDK(config);
 
@@ -391,7 +557,7 @@ program
       try {
         const score = await sdk.computeScore(keypair, upperAddr);
 
-        if (options.json) {
+        if (cmdOptions.json) {
           console.log(JSON.stringify({ score }, null, 2));
         } else {
           console.log(`\n✅ Computed Score: ${score}`);
@@ -639,7 +805,7 @@ program
     console.log(`Fetching registered issuers on ${network}...`);
 
     try {
-      const issuers = await sdk.getRegisteredIssuers();
+      const issuers = await sdk.listIssuers();
 
       console.log();
       if (issuers.length === 0) {
@@ -690,6 +856,68 @@ program
   });
 
 // ---------------------------------------------------------------------------
+// Command: tx-stats
+// ---------------------------------------------------------------------------
+
+program
+  .command("tx-stats")
+  .description(
+    "Fetch the 30-day transaction statistics a feeder submitted for a subject via update_tx_stats.",
+  )
+  .argument("<subject-address>", "Stellar G... address of the subject")
+  .option("--json", "Output the full TxStats as JSON")
+  .action(async (subjectAddress: string, cmdOptions: { json?: boolean }) => {
+    const options = program.opts();
+    const network = options.network as NetworkType;
+    const config = loadConfig(network);
+    validateConfig(config, ['creditOracleId'], true);
+    const upperAddr = subjectAddress.toUpperCase();
+    assertStellarAddress("subject-address", upperAddr);
+
+    const sdk = new StellarDIDCreditSDK(config);
+
+    if (!cmdOptions.json) {
+      console.log(
+        `Fetching transaction statistics for ${upperAddr} on ${network}...`,
+      );
+    }
+
+    try {
+      const stats = await sdk.getTxStats(upperAddr);
+
+      if (stats === null) {
+        if (cmdOptions.json) {
+          console.log(JSON.stringify({ txStats: null }));
+        } else {
+          console.log();
+          console.log(
+            "No transaction statistics have been submitted for this subject yet.",
+          );
+        }
+        process.exit(0);
+        return;
+      }
+
+      if (cmdOptions.json) {
+        console.log(JSON.stringify(stats, (key, value) => {
+          if (typeof value === "bigint") return value.toString();
+          return value;
+        }, 2));
+        process.exit(0);
+        return;
+      } else {
+        printTxStats(stats);
+      }
+    } catch (err) {
+      console.error(
+        "Failed:",
+        err instanceof Error ? err.message : err,
+      );
+      process.exit(1);
+    }
+  });
+
+// ---------------------------------------------------------------------------
 // Command: anchor-vc
 // ---------------------------------------------------------------------------
 
@@ -703,6 +931,7 @@ program
   .argument("<subject-address>", "Stellar G... address of the credential subject")
   .argument("<vc-hash>", "SHA-256 hash of the verifiable credential (64 hex characters)")
   .option("--type <type>", "Optional credential type label (e.g. kyc, employment)")
+  .option("--dry-run", "Simulate transaction execution without broadcasting")
   .addHelpText(
     "after",
     `
@@ -710,15 +939,44 @@ Example:
   $ stellar-did anchor-vc S... G... 5c4146... --type kyc
 `
   )
-  .action(async (issuerSecret: string, subjectAddress: string, vcHashHex: string, cmdOptions: { type?: string }) => {
+  .action(async (issuerSecret: string, subjectAddress: string, vcHashHex: string, cmdOptions: { type?: string; dryRun?: boolean }) => {
     const options = program.opts();
     const network = options.network as NetworkType;
     const config = loadConfig(network);
+    validateConfig(config, ['identityOracleId']);
     
     const keypair = parseSecret(issuerSecret);
     const upperAddr = subjectAddress.toUpperCase();
     assertStellarAddress("subject-address", upperAddr);
     const vcHash = parseVcHash(vcHashHex);
+
+    if (cmdOptions.dryRun) {
+      const contract = new Contract(config.identityOracleId!);
+      const hashScVal = nativeToScVal(new Uint8Array(vcHash), { type: "bytes" });
+      const operation = cmdOptions.type
+        ? contract.call(
+            "anchor_vc_typed",
+            new Address(keypair.publicKey()).toScVal(),
+            new Address(upperAddr).toScVal(),
+            hashScVal,
+            nativeToScVal(cmdOptions.type),
+          )
+        : contract.call(
+            "anchor_vc",
+            new Address(keypair.publicKey()).toScVal(),
+            new Address(upperAddr).toScVal(),
+            hashScVal,
+          );
+      await simulateDryRun({
+        rpcUrl: config.rpcUrl,
+        networkPassphrase: config.networkPassphrase,
+        sourceKeypair: keypair,
+        contractId: config.identityOracleId!,
+        operation,
+        label: "anchor-vc",
+      });
+      return;
+    }
 
     const sdk = new StellarDIDCreditSDK(config);
 
@@ -730,7 +988,6 @@ Example:
     }
 
     try {
-      // @ts-ignore
       const txHash = await sdk.issueVC(keypair, upperAddr, vcHash, cmdOptions.type);
 
       console.log();
@@ -879,6 +1136,376 @@ program
       process.exit(1);
     }
   });
+
+// ---------------------------------------------------------------------------
+// Command group: governance
+// ---------------------------------------------------------------------------
+
+const governance = program
+  .command("governance")
+  .description("Protocol governance commands.");
+
+governance
+  .command("list")
+  .description("List governance proposals.")
+  .option("--from <id>", "Starting proposal ID (default: 1)", (val) => BigInt(val))
+  .option("--limit <n>", "Maximum number of proposals to fetch", parseInt)
+  .action(
+    async (cmdOptions: { from?: bigint; limit?: number }) => {
+      const globalOptions = program.opts();
+      const network = globalOptions.network as NetworkType;
+      const config = loadConfig(network);
+      validateConfig(config, ['governanceId']);
+
+      const sdk = new StellarDIDCreditSDK(config);
+      console.log(`Fetching governance proposals on ${network}...`);
+
+      try {
+        const proposals = await sdk.governance.listProposals(
+          cmdOptions.from,
+          cmdOptions.limit,
+        );
+
+        console.log();
+        if (proposals.length === 0) {
+          console.log("No proposals found.");
+          return;
+        }
+
+        for (const p of proposals) {
+          const status = p.executed
+            ? "EXECUTED"
+            : p.cancelled
+            ? "CANCELLED"
+            : "ACTIVE";
+          console.log(`Proposal #${p.id.toString()} [${status}]`);
+          console.log(`  Proposer:        ${p.proposer}`);
+          console.log(
+            `  Weights:         VC: ${p.proposedWeights.vcWeight}%, TX: ${p.proposedWeights.txWeight}%, Repayment: ${p.proposedWeights.repaymentWeight}%`,
+          );
+          console.log(
+            `  Votes:           For: ${p.votesFor.toString()} | Against: ${p.votesAgainst.toString()} | Quorum: ${p.quorumRequired.toString()}`,
+          );
+          console.log(
+            `  Expiry Ledger:   ${p.expiryLedger} (Delay: ${p.executionDelayLedgers} ledgers)`,
+          );
+          console.log();
+        }
+      } catch (err) {
+        console.error("Failed:", err instanceof Error ? err.message : err);
+        process.exit(1);
+      }
+    },
+  );
+
+governance
+  .command("create-proposal")
+  .description("Create a scoring-weight proposal.")
+  .argument("<proposer-secret>", "Stellar secret key of the proposer (starts with S)")
+  .argument("<vc-weight>", "VC score weight (0-100)", parseInt)
+  .argument("<tx-weight>", "Transaction history score weight (0-100)", parseInt)
+  .argument("<repay-weight>", "Repayment score weight (0-100)", parseInt)
+  .option("--voting-period <ledgers>", "Voting period in ledgers", parseInt, 17280)
+  .option("--delay <ledgers>", "Execution delay in ledgers", parseInt, 0)
+  .option("--dry-run", "Simulate transaction execution without broadcasting")
+  .action(
+    async (
+      proposerSecret: string,
+      vcWeight: number,
+      txWeight: number,
+      repayWeight: number,
+      cmdOptions: { votingPeriod: number; delay: number; dryRun?: boolean },
+    ) => {
+      const globalOptions = program.opts();
+      const network = globalOptions.network as NetworkType;
+      const config = loadConfig(network);
+      validateConfig(config, ['governanceId']);
+      const keypair = parseSecret(proposerSecret);
+
+      const weights: ScoringWeights = {
+        vcWeight,
+        txWeight,
+        repaymentWeight: repayWeight,
+      };
+
+      if (cmdOptions.dryRun) {
+        const contract = new Contract(config.governanceId!);
+        const operation = contract.call(
+          "create_proposal",
+          new Address(keypair.publicKey()).toScVal(),
+          scoringWeightsToScVal(weights),
+          nativeToScVal(cmdOptions.votingPeriod, { type: "u32" }),
+          nativeToScVal(cmdOptions.delay, { type: "u32" }),
+        );
+        await simulateDryRun({
+          rpcUrl: config.rpcUrl,
+          networkPassphrase: config.networkPassphrase,
+          sourceKeypair: keypair,
+          contractId: config.governanceId!,
+          operation,
+          label: "governance create-proposal",
+        });
+        return;
+      }
+
+      const sdk = new StellarDIDCreditSDK(config);
+      console.log(`Creating governance proposal on ${network}...`);
+      console.log(`  Proposer: ${keypair.publicKey()}`);
+
+      try {
+        const proposalId = await sdk.governance.createProposal(
+          keypair,
+          weights,
+          cmdOptions.votingPeriod,
+          cmdOptions.delay,
+        );
+        console.log();
+        console.log("Success!");
+        console.log(`  Proposal ID: ${proposalId.toString()}`);
+      } catch (err) {
+        console.error("Failed:", err instanceof Error ? err.message : err);
+        process.exit(1);
+      }
+    },
+  );
+
+governance
+  .command("execute")
+  .description("Execute an approved governance proposal.")
+  .argument("<payer-secret>", "Stellar secret key of the fee payer (starts with S)")
+  .argument("<proposal-id>", "ID of the proposal to execute")
+  .option("--dry-run", "Simulate transaction execution without broadcasting")
+  .action(
+    async (
+      payerSecret: string,
+      proposalId: string,
+      cmdOptions: { dryRun?: boolean },
+    ) => {
+      const globalOptions = program.opts();
+      const network = globalOptions.network as NetworkType;
+      const config = loadConfig(network);
+      validateConfig(config, ['governanceId']);
+      const keypair = parseSecret(payerSecret);
+
+      if (cmdOptions.dryRun) {
+        const contract = new Contract(config.governanceId!);
+        const operation = contract.call(
+          "execute",
+          nativeToScVal(BigInt(proposalId), { type: "u64" }),
+        );
+        await simulateDryRun({
+          rpcUrl: config.rpcUrl,
+          networkPassphrase: config.networkPassphrase,
+          sourceKeypair: keypair,
+          contractId: config.governanceId!,
+          operation,
+          label: "governance execute",
+        });
+        return;
+      }
+
+      const sdk = new StellarDIDCreditSDK(config);
+      console.log(`Executing governance proposal ${proposalId} on ${network}...`);
+
+      try {
+        const txHash = await sdk.governance.execute(keypair, BigInt(proposalId));
+        console.log();
+        console.log("Success!");
+        console.log(`  Transaction: ${txHash}`);
+      } catch (err) {
+        console.error("Failed:", err instanceof Error ? err.message : err);
+        process.exit(1);
+      }
+    },
+  );
+
+governance
+  .command("apply-weights")
+  .description("Apply queued scoring weights after the credit-oracle timelock expires.")
+  .argument("<payer-secret>", "Stellar secret key of the fee payer (starts with S)")
+  .option("--dry-run", "Simulate transaction execution without broadcasting")
+  .action(
+    async (
+      payerSecret: string,
+      cmdOptions: { dryRun?: boolean },
+    ) => {
+      const globalOptions = program.opts();
+      const network = globalOptions.network as NetworkType;
+      const config = loadConfig(network);
+      validateConfig(config, ['governanceId']);
+      const keypair = parseSecret(payerSecret);
+
+      if (cmdOptions.dryRun) {
+        const contract = new Contract(config.governanceId!);
+        const operation = contract.call("apply_weights");
+        await simulateDryRun({
+          rpcUrl: config.rpcUrl,
+          networkPassphrase: config.networkPassphrase,
+          sourceKeypair: keypair,
+          contractId: config.governanceId!,
+          operation,
+          label: "governance apply-weights",
+        });
+        return;
+      }
+
+      const sdk = new StellarDIDCreditSDK(config);
+      console.log(`Applying governance weights on ${network}...`);
+
+      try {
+        const txHash = await sdk.governance.applyWeights(keypair);
+        console.log();
+        console.log("Success!");
+        console.log(`  Transaction: ${txHash}`);
+      } catch (err) {
+        console.error("Failed:", err instanceof Error ? err.message : err);
+        process.exit(1);
+      }
+    },
+  );
+
+/**
+ * Parses a voter weight into a bigint. Weights must be non-negative integers;
+ * when `allowZero` is false, zero is rejected too.
+ */
+function parseVoterWeight(value: string, allowZero: boolean): bigint {
+  if (!/^\d+$/.test(value)) {
+    throw new InvalidArgumentError("weight must be a non-negative integer.");
+  }
+  const weight = BigInt(value);
+  if (!allowZero && weight === 0n) {
+    throw new InvalidArgumentError(
+      "weight must be greater than 0 (use update-voter-weight with 0 to deregister).",
+    );
+  }
+  return weight;
+}
+
+function parseRegisterWeight(value: string): bigint {
+  return parseVoterWeight(value, false);
+}
+
+function parseUpdateWeight(value: string): bigint {
+  return parseVoterWeight(value, true);
+}
+
+/**
+ * Shared implementation for the voter-admin governance commands.
+ */
+async function runVoterAdminCommand(params: {
+  method: "registerVoter" | "updateVoterWeight";
+  contractFn: "register_voter" | "update_voter_weight";
+  label: string;
+  progress: string;
+  adminSecret: string;
+  voter: string;
+  weight: bigint;
+  dryRun?: boolean;
+}): Promise<void> {
+  const { method, contractFn, label, progress, adminSecret, voter, weight } = params;
+  const network = program.opts().network as NetworkType;
+  const config = loadConfig(network);
+  validateConfig(config, ['governanceId']);
+  const keypair = parseSecret(adminSecret);
+  assertStellarAddress("voter", voter);
+
+  if (params.dryRun) {
+    const contract = new Contract(config.governanceId!);
+    const operation = contract.call(
+      contractFn,
+      new Address(keypair.publicKey()).toScVal(),
+      new Address(voter).toScVal(),
+      nativeToScVal(weight, { type: "i128" }),
+    );
+    await simulateDryRun({
+      rpcUrl: config.rpcUrl,
+      networkPassphrase: config.networkPassphrase,
+      sourceKeypair: keypair,
+      contractId: config.governanceId!,
+      operation,
+      label,
+    });
+    return;
+  }
+
+  const sdk = new StellarDIDCreditSDK(config);
+  console.log(`${progress} on ${network}...`);
+  console.log(`  Admin:  ${keypair.publicKey()}`);
+  console.log(`  Voter:  ${voter}`);
+  console.log(`  Weight: ${weight.toString()}`);
+
+  try {
+    const txHash = await sdk.governance[method](keypair, voter, weight);
+    const explorerBase = network === 'mainnet' ? 'https://stellar.expert/explorer/public' : 'https://stellar.expert/explorer/testnet';
+    console.log();
+    console.log("Success!");
+    console.log(`  Transaction: ${txHash}`);
+    console.log(`  Explorer:    ${explorerBase}/tx/${txHash}`);
+  } catch (err) {
+    console.error("Failed:", err instanceof Error ? err.message : err);
+    process.exit(1);
+  }
+}
+
+governance
+  .command("register-voter")
+  .description(
+    "Register a new governance voter with a voting weight (admin only). " +
+      "Voters must be registered before proposals can reach quorum.",
+  )
+  .argument("<admin-secret>", "Stellar secret key of the governance admin (starts with S)")
+  .argument("<voter-address>", "Stellar address of the voter (G...)")
+  .argument("<weight>", "Voting weight to assign (positive integer)", parseRegisterWeight)
+  .option("--dry-run", "Simulate transaction execution without broadcasting")
+  .action(
+    async (
+      adminSecret: string,
+      voter: string,
+      weight: bigint,
+      cmdOptions: { dryRun?: boolean },
+    ) => {
+      await runVoterAdminCommand({
+        method: "registerVoter",
+        contractFn: "register_voter",
+        label: "governance register-voter",
+        progress: "Registering governance voter",
+        adminSecret,
+        voter,
+        weight,
+        dryRun: cmdOptions.dryRun,
+      });
+    },
+  );
+
+governance
+  .command("update-voter-weight")
+  .description(
+    "Update the voting weight of a registered voter (admin only). " +
+      "Set weight to 0 to deregister the voter.",
+  )
+  .argument("<admin-secret>", "Stellar secret key of the governance admin (starts with S)")
+  .argument("<voter-address>", "Stellar address of the voter (G...)")
+  .argument("<weight>", "New voting weight (non-negative integer; 0 deregisters)", parseUpdateWeight)
+  .option("--dry-run", "Simulate transaction execution without broadcasting")
+  .action(
+    async (
+      adminSecret: string,
+      voter: string,
+      weight: bigint,
+      cmdOptions: { dryRun?: boolean },
+    ) => {
+      await runVoterAdminCommand({
+        method: "updateVoterWeight",
+        contractFn: "update_voter_weight",
+        label: "governance update-voter-weight",
+        progress: "Updating governance voter weight",
+        adminSecret,
+        voter,
+        weight,
+        dryRun: cmdOptions.dryRun,
+      });
+    },
+  );
 
 // ---------------------------------------------------------------------------
 // Parse

@@ -442,6 +442,12 @@ mod tests {
         // Also verify that is_verified and get_active_vc_count correctly reflect the revocation
         assert!(!identity.is_verified(&subject));
         assert_eq!(identity.get_active_vc_count(&subject), 0);
+
+        // The subject forwarded to revoke() enables the per-subject revoked list
+        assert_eq!(
+            identity.list_revoked_for_subject(&subject),
+            soroban_sdk::vec![&env, vc_hash.clone()]
+        );
     }
 
     #[test]
@@ -1825,7 +1831,124 @@ mod tests {
         assert_eq!(rec1_v2_updated.total_repaid, 5000);
     }
 
-    // -- Compute-score cooldown tests --------------------------------------
+    #[test]
+    fn test_identity_oracle_migration_flow() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register_contract(None, IdentityOracle);
+        let client = IdentityOracleClient::new(&env, &contract_id);
+
+        let admin = soroban_sdk::Address::generate(&env);
+        let issuer = soroban_sdk::Address::generate(&env);
+        let subject = soroban_sdk::Address::generate(&env);
+        let did_uri = String::from_str(&env, "ipfs://QmTestDIDDocumentHash123456789012345678901234");
+
+        let mut hash_bytes = [0u8; 32];
+        hash_bytes[0] = 42;
+        let vc_hash = BytesN::from_array(&env, &hash_bytes);
+        let vc_record = identity_oracle::VCRecord {
+            vc_hash: vc_hash.clone(),
+            issuer: issuer.clone(),
+            anchored_at: env.ledger().timestamp(),
+            revoked: false,
+        };
+
+        // Simulate a V1 deployment by manually writing storage entries without StorageVersion.
+        env.as_contract(&contract_id, || {
+            // Instance storage: Admin set, StorageVersion NOT set (simulating V1)
+            env.storage()
+                .instance()
+                .set(&identity_oracle::DataKey::Admin, &admin);
+            assert!(!env
+                .storage()
+                .instance()
+                .has(&identity_oracle::DataKey::StorageVersion));
+
+            // Persistent storage: simulate pre-migration identity records
+            env.storage()
+                .persistent()
+                .set(&identity_oracle::DataKey::TrustedIssuer(issuer.clone()), &true);
+            let mut issuers = soroban_sdk::Vec::new(&env);
+            issuers.push_back(issuer.clone());
+            env.storage()
+                .persistent()
+                .set(&identity_oracle::DataKey::IssuersIndex, &issuers);
+            env.storage()
+                .persistent()
+                .set(&identity_oracle::DataKey::DIDDocument(subject.clone()), &did_uri);
+
+            let mut vcs = soroban_sdk::Vec::new(&env);
+            vcs.push_back(vc_record);
+            env.storage()
+                .persistent()
+                .set(&identity_oracle::DataKey::VCAnchors(subject.clone()), &vcs);
+            env.storage()
+                .persistent()
+                .set(&identity_oracle::DataKey::ActiveVCCount(subject.clone()), &1u32);
+        });
+
+        // Verify StorageVersion is absent before migration
+        let version_before: Option<u32> = env.as_contract(&contract_id, || {
+            env.storage()
+                .instance()
+                .get(&identity_oracle::DataKey::StorageVersion)
+        });
+        assert_eq!(version_before, None);
+
+        // Verify pre-migration state is readable
+        let issuers_before = client.list_issuers();
+        assert_eq!(issuers_before.len(), 1);
+        assert_eq!(issuers_before.get(0).unwrap(), issuer);
+        assert_eq!(client.has_anchored_did(&subject), true);
+        assert_eq!(client.get_did_document(&subject), Some(did_uri.clone()));
+        assert_eq!(client.is_verified(&subject), true);
+        assert_eq!(client.get_active_vc_count(&subject), 1);
+        assert_eq!(client.get_vc_count(&subject), 1);
+        assert_eq!(client.verify_vc(&subject, &vc_hash), true);
+
+        // Execute migration
+        client.migrate();
+
+        // Verify StorageVersion is now set to 2
+        let version_after: Option<u32> = env.as_contract(&contract_id, || {
+            env.storage()
+                .instance()
+                .get(&identity_oracle::DataKey::StorageVersion)
+        });
+        assert_eq!(version_after, Some(2u32));
+
+        // Verify reads still work properly after migration
+        let issuers_list = client.list_issuers();
+        assert_eq!(issuers_list.len(), 1);
+        assert_eq!(issuers_list.get(0).unwrap(), issuer);
+        assert_eq!(client.has_anchored_did(&subject), true);
+        assert_eq!(client.get_did_document(&subject), Some(did_uri));
+        assert_eq!(client.is_verified(&subject), true);
+        assert_eq!(client.get_active_vc_count(&subject), 1);
+        assert_eq!(client.get_vc_count(&subject), 1);
+        assert_eq!(client.verify_vc(&subject, &vc_hash), true);
+        let vc_records = client.get_vc_details(&subject);
+        assert_eq!(vc_records.len(), 1);
+        assert_eq!(vc_records.get(0).unwrap().vc_hash, vc_hash);
+
+        // Verify new operations continue to succeed after migration
+        let subject2 = soroban_sdk::Address::generate(&env);
+        let did_uri2 = String::from_str(&env, "ipfs://QmSecondSubjectDIDDocumentHash123456789012");
+        client.anchor_did(&subject2, &did_uri2);
+        assert_eq!(client.get_did_document(&subject2), Some(did_uri2));
+
+        // Verify migrate is idempotent
+        client.migrate();
+        let version_idempotent: Option<u32> = env.as_contract(&contract_id, || {
+            env.storage()
+                .instance()
+                .get(&identity_oracle::DataKey::StorageVersion)
+        });
+        assert_eq!(version_idempotent, Some(2u32));
+    }
+
+    // ── Compute-score cooldown tests ──────────────────────────────────────
 
     /// cooldown = 1 (default): second call within the same ledger is rejected.
     #[test]
@@ -2505,6 +2628,125 @@ mod tests {
         env.ledger()
             .set_sequence_number(env.ledger().sequence() + 1);
         assert_eq!(credit.compute_score(&subject), baseline);
+    }
+
+    /// Full cross-contract integration test for the governance → credit-oracle
+    /// weight update flow. Deploys all four contracts, transfers credit-oracle
+    /// admin to governance, creates a weight-change proposal, votes, executes
+    /// (which calls propose_weights on credit-oracle), advances past the
+    /// timelock, applies weights via governance, and verifies the credit-oracle
+    /// weights actually changed.
+    #[test]
+    fn test_governance_credit_oracle_weight_update_flow() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        // 1. Deploy all four contracts
+        let identity_id = env.register_contract(None, IdentityOracle);
+        let credit_id = env.register_contract(None, CreditOracle);
+        let revocation_id = env.register_contract(None, RevocationRegistry);
+        let gov_id = env.register_contract(None, Governance);
+
+        let identity = IdentityOracleClient::new(&env, &identity_id);
+        let credit = CreditOracleClient::new(&env, &credit_id);
+        let revocation = RevocationRegistryClient::new(&env, &revocation_id);
+        let gov = GovernanceClient::new(&env, &gov_id);
+
+        let admin = Address::generate(&env);
+
+        // 2. Initialize all four contracts
+        identity.initialize(&admin);
+        credit.initialize(&admin);
+        revocation.initialize(&admin);
+        gov.initialize(&admin, &credit_id, &1000);
+
+        // 3. Verify default weights before the proposal
+        let default_weights = credit.get_scoring_weights();
+        assert_eq!(default_weights.vc_weight, 40);
+        assert_eq!(default_weights.tx_weight, 30);
+        assert_eq!(default_weights.repayment_weight, 30);
+
+        // 4. Transfer credit-oracle admin to governance contract
+        credit.propose_new_admin(&gov_id);
+        gov.accept_oracle_admin();
+
+        // 5. Create a proposal with new weights
+        let proposed_weights = ScoringWeights {
+            vc_weight: 50,
+            tx_weight: 20,
+            repayment_weight: 30,
+        };
+
+        let proposer = Address::generate(&env);
+        let proposal_id = gov.create_proposal(&proposer, &proposed_weights, &100, &0);
+        assert_eq!(proposal_id, 1);
+
+        // 6. Register voters and vote
+        let voter1 = Address::generate(&env);
+        let voter2 = Address::generate(&env);
+        gov.register_voter(&admin, &voter1, &1000);
+        gov.register_voter(&admin, &voter2, &400);
+
+        gov.vote(&voter1, &proposal_id, &true, &1000);
+        gov.vote(&voter2, &proposal_id, &false, &400);
+
+        let proposal = gov.get_proposal(&proposal_id).unwrap();
+        assert_eq!(proposal.votes_for, 1000);
+        assert_eq!(proposal.votes_against, 400);
+        assert!(!proposal.executed);
+
+        // 7. Advance ledger past voting period
+        env.ledger().with_mut(|l| {
+            l.sequence_number += 101;
+        });
+
+        // 8. Execute proposal — calls propose_weights on credit-oracle
+        gov.execute(&proposal_id);
+
+        let proposal = gov.get_proposal(&proposal_id).unwrap();
+        assert!(proposal.executed);
+
+        // 9. Verify weights are NOT changed yet (timelock in effect)
+        let weights_after_execute = credit.get_scoring_weights();
+        assert_eq!(weights_after_execute.vc_weight, 40);
+        assert_eq!(weights_after_execute.tx_weight, 30);
+        assert_eq!(weights_after_execute.repayment_weight, 30);
+
+        // 10. Verify pending weights exist
+        let pending = credit.get_pending_weights();
+        assert!(pending.is_some());
+        let pending_record = pending.unwrap();
+        assert_eq!(pending_record.weights.vc_weight, 50);
+        assert_eq!(pending_record.weights.tx_weight, 20);
+        assert_eq!(pending_record.weights.repayment_weight, 30);
+
+        // 11. Advance ledger past timelock (17,280 ledgers + 2 buffer)
+        let jump = 17_280 + 2;
+        // Extend TTL on all four contracts to prevent archival during the jump
+        env.as_contract(&identity_id, || {
+            env.storage().instance().extend_ttl(jump, jump);
+        });
+        env.as_contract(&credit_id, || {
+            env.storage().instance().extend_ttl(jump, jump);
+        });
+        env.as_contract(&revocation_id, || {
+            env.storage().instance().extend_ttl(jump, jump);
+        });
+        env.as_contract(&gov_id, || {
+            env.storage().instance().extend_ttl(jump, jump);
+        });
+        env.ledger().with_mut(|l| {
+            l.sequence_number += jump;
+        });
+
+        // 12. Apply weights via governance (gov.apply_weights calls credit-oracle)
+        gov.apply_weights();
+
+        // 13. Verify credit-oracle weights actually changed
+        let active_weights = credit.get_scoring_weights();
+        assert_eq!(active_weights.vc_weight, 50);
+        assert_eq!(active_weights.tx_weight, 20);
+        assert_eq!(active_weights.repayment_weight, 30);
     }
 }
 

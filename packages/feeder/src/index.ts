@@ -1215,6 +1215,7 @@ export class Feeder {
       `[feeder] Cycle complete: ${succeeded} succeeded, ${skipped} skipped, ${failed} failed`,
     );
 
+    this.config.healthTracker?.setDeadLetterSubjects(this.getDeadLetterSubjects());
     this.config.healthTracker?.recordCycleResult(succeeded, failed);
   }
 

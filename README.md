@@ -96,12 +96,21 @@ Manages decentralized identifiers and verifiable credential anchoring.
 | `register_issuer(admin, issuer)`            | Adds a trusted VC issuer                        |
 | `deregister_issuer(admin, issuer)`          | Revokes a trusted issuer (existing VCs persist) |
 | `anchor_did(subject, did_doc_cid)`          | Stores the IPFS CID of a DID document           |
+| `get_did_document(subject)`                 | Returns the anchored DID document CID           |
+| `deactivate_did(subject)`                   | Deactivates DID, removes DID doc CID, and revokes VCs (`DIDDeact`) |
+| `deactivate_identity(subject)`              | Suspends identity & revokes VCs, retaining DID doc CID (`IdDeact`) |
+| `reactivate_identity(subject)`              | Restores active identity status (clears deactivation flag; `IdReact`) |
+| `is_deactivated(subject)`                   | Returns true if subject identity is deactivated |
 | `anchor_vc(issuer, subject, vc_hash)`       | Anchors a VC hash from a trusted issuer         |
 | `is_verified(subject)`                      | Returns true if subject has ≥ 1 non-revoked VC  |
-| `get_vc_count(subject)`                     | Returns the number of anchored VCs              |
+| `get_vc_count(subject)`                     | Returns the total number of anchored VCs, including revoked ones |
+| `get_active_vc_count(subject)`              | Returns the number of non-revoked VCs — the count used internally by `compute_score` |
 | `verify_vc(subject, vc_hash)`               | Checks if a specific VC hash is valid           |
 | `mark_vc_revoked(issuer, subject, vc_hash)` | Marks a VC as revoked                           |
+| `list_revoked_for_subject(subject)`         | Returns the VC hashes revoked for a subject     |
 | `upgrade(admin, new_wasm_hash)`             | Upgrades the contract WASM in-place             |
+
+> **Note for feeders and lenders:** Use `get_active_vc_count` when you need the VC count used for scoring. `get_vc_count` includes revoked VCs and will return a higher number than what `compute_score` actually uses.
 
 ### credit-oracle
 
@@ -145,12 +154,12 @@ On-chain proposal creation, weighted voting, and multi-step execution for updati
 
 ### revocation-registry
 
-Maintains an on-chain list of revoked credential hashes.
+Maintains an on-chain list of revoked credential hashes. Revocation status is keyed only by `vc_hash`; the `subject` parameter of `revoke` is forwarded to the linked identity-oracle (`mark_vc_revoked`) so per-subject revocations can be queried via `list_revoked_for_subject(subject)` on the identity-oracle contract.
 
 | Function                          | Description                                     |
 | --------------------------------- | ----------------------------------------------- |
 | `initialize(admin)`               | Sets the contract admin                         |
-| `revoke(issuer, vc_hash)`         | Revokes a credential by hash                    |
+| `revoke(issuer, subject, vc_hash)` | Revokes a credential by hash; `subject` updates the linked identity-oracle's per-subject record |
 | `batch_revoke(issuer, vc_hashes)` | Revokes multiple credentials in one transaction |
 | `is_revoked(vc_hash)`             | Returns true if the credential has been revoked |
 | `list_revoked_for_issuer(issuer)` | Returns all VC hashes revoked by the issuer    |

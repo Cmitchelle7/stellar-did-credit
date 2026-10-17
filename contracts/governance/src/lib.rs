@@ -1,4 +1,4 @@
-﻿#![no_std]
+#![no_std]
 //! Governance contract for the Stellar DID Credit protocol.
 //!
 //! Provides on-chain proposal creation, voting, and execution that can
@@ -48,6 +48,8 @@ pub enum GovernanceError {
     VoteTallyOverflow = 17,
     /// Proposal did not receive more for-votes than against-votes.
     ProposalRejected = 18,
+    /// Voting period cannot be zero.
+    InvalidVotingPeriod = 19,
 }
 
 /// Storage keys for the governance contract.
@@ -62,6 +64,8 @@ pub enum DataKey {
     NextProposalId,
     /// Default quorum (minimum total votes) required for proposal execution.
     QuorumRequired,
+    /// Optional percentage of total registered voting weight required for new proposals.
+    QuorumPercent,
     /// Proposal data stored by proposal ID.
     Proposal(u64),
     /// Original proposer address for a given proposal ID.
@@ -222,7 +226,29 @@ impl Governance {
         env.storage()
             .instance()
             .set(&DataKey::QuorumRequired, &quorum_required);
+        env.storage().instance().remove(&DataKey::QuorumPercent);
         Ok(())
+    }
+
+    /// Configure the quorum for future proposals as a percentage of currently
+    /// registered voting weight. The computed quorum is snapshotted at proposal creation.
+    pub fn set_quorum_percent(env: Env, admin: Address, percent: u32) -> Result<(), GovernanceError> {
+        if percent == 0 || percent > 100 {
+            return Err(GovernanceError::InvalidQuorum);
+        }
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin)
+            .ok_or(GovernanceError::NotAuthorized)?;
+        if admin != stored_admin {
+            return Err(GovernanceError::NotAuthorized);
+        }
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::QuorumPercent, &percent);
+        Ok(())
+    }
+
+    /// Return the percentage-based quorum configuration, if enabled.
+    pub fn get_quorum_percent(env: Env) -> Option<u32> {
+        env.storage().instance().get(&DataKey::QuorumPercent)
     }
 
     /// Returns the contract-wide default quorum applied to newly created proposals.
@@ -261,6 +287,9 @@ impl Governance {
         if !weights.is_valid() {
             return Err(GovernanceError::InvalidWeights);
         }
+        if voting_period_ledgers == 0 {
+            return Err(GovernanceError::InvalidVotingPeriod);
+        }
 
         let id: u64 = env
             .storage()
@@ -268,11 +297,13 @@ impl Governance {
             .get(&DataKey::NextProposalId)
             .unwrap_or(FIRST_PROPOSAL_ID);
         let expiry_ledger = env.ledger().sequence() + voting_period_ledgers;
-        let quorum_required: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::QuorumRequired)
-            .unwrap_or(0);
+        let quorum_required = match env.storage().instance().get::<_, u32>(&DataKey::QuorumPercent) {
+            Some(percent) => {
+                let total: i128 = env.storage().instance().get(&DataKey::TotalRegisteredWeight).unwrap_or(0);
+                total.checked_mul(i128::from(percent)).ok_or(GovernanceError::InvalidQuorum)? / 100
+            }
+            None => env.storage().instance().get(&DataKey::QuorumRequired).unwrap_or(0),
+        };
 
         let proposal = GovernanceProposal {
             id,
@@ -618,6 +649,15 @@ impl Governance {
         }
         admin.require_auth();
 
+        // `register_voter` is also the upsert entry point for voter weights.
+        // Replace (rather than add to) any existing weight so the aggregate
+        // remains an accurate basis for percentage-based quorum calculations.
+        let old_weight: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::VoterWeight(voter.clone()))
+            .unwrap_or(0);
+
         env.storage()
             .persistent()
             .set(&DataKey::VoterWeight(voter.clone()), &weight);
@@ -634,7 +674,7 @@ impl Governance {
             .unwrap_or(0);
         env.storage()
             .instance()
-            .set(&DataKey::TotalRegisteredWeight, &(total + weight));
+            .set(&DataKey::TotalRegisteredWeight, &(total - old_weight + weight));
 
         env.events()
             .publish((symbol_short!("VoterReg"), voter.clone()), weight);
@@ -1588,6 +1628,53 @@ mod tests {
     }
 
     #[test]
+    fn test_quorum_percent_uses_total_registered_weight_for_new_proposals() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let credit_oracle_id = env.register_contract(None, CreditOracle);
+        CreditOracleClient::new(&env, &credit_oracle_id).initialize(&admin);
+        let gov_id = env.register_contract(None, Governance);
+        let client = GovernanceClient::new(&env, &gov_id);
+        client.initialize(&admin, &credit_oracle_id, &1);
+        client.register_voter(&admin, &Address::generate(&env), &101);
+        client.set_quorum_percent(&admin, &50);
+        assert_eq!(client.get_quorum_percent(), Some(50));
+        let proposal_id = client.create_proposal(&Address::generate(&env), &ScoringWeights { vc_weight: 40, tx_weight: 30, repayment_weight: 30 }, &10, &0);
+        assert_eq!(client.get_proposal(&proposal_id).unwrap().quorum_required, 50);
+    }
+
+    #[test]
+    fn test_reregistering_voter_keeps_relative_quorum_total_accurate() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let voter = Address::generate(&env);
+        let credit_oracle_id = env.register_contract(None, CreditOracle);
+        CreditOracleClient::new(&env, &credit_oracle_id).initialize(&admin);
+        let gov_id = env.register_contract(None, Governance);
+        let client = GovernanceClient::new(&env, &gov_id);
+        client.initialize(&admin, &credit_oracle_id, &1);
+
+        client.register_voter(&admin, &voter, &100);
+        client.register_voter(&admin, &voter, &40);
+        assert_eq!(client.get_total_registered_weight(), 40);
+
+        client.set_quorum_percent(&admin, &50);
+        let proposal_id = client.create_proposal(
+            &Address::generate(&env),
+            &ScoringWeights {
+                vc_weight: 40,
+                tx_weight: 30,
+                repayment_weight: 30,
+            },
+            &10,
+            &0,
+        );
+        assert_eq!(client.get_proposal(&proposal_id).unwrap().quorum_required, 20);
+    }
+
+    #[test]
     fn test_unregistered_voter_cannot_vote() {
         let env = Env::default();
         env.mock_all_auths();
@@ -1932,5 +2019,155 @@ mod tests {
             &10,
         );
         assert_eq!(prop_id, 1);
+    }
+
+    #[test]
+    fn test_create_proposal_zero_period() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let credit_oracle_id = env.register_contract(None, CreditOracle);
+        CreditOracleClient::new(&env, &credit_oracle_id).initialize(&admin);
+
+        let gov_id = env.register_contract(None, Governance);
+        let gov_client = GovernanceClient::new(&env, &gov_id);
+        gov_client.initialize(&admin, &credit_oracle_id, &100);
+
+        let proposer = Address::generate(&env);
+
+        let res = gov_client.try_create_proposal(
+            &proposer,
+            &ScoringWeights {
+                vc_weight: 40,
+                tx_weight: 30,
+                repayment_weight: 30,
+            },
+            &0,
+            &10,
+        );
+        assert_eq!(res, Err(Ok(GovernanceError::InvalidVotingPeriod)));
+    }
+
+    /// Issue #763: Proposals where `votes_against > votes_for` must fail execution
+    /// with `ProposalRejected`, even when total votes meet the required quorum (100).
+    #[test]
+    fn test_governance_majority_check() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let credit_oracle_id = env.register_contract(None, CreditOracle);
+        CreditOracleClient::new(&env, &credit_oracle_id).initialize(&admin);
+
+        let gov_id = env.register_contract(None, Governance);
+        let gov_client = GovernanceClient::new(&env, &gov_id);
+        gov_client.initialize(&admin, &credit_oracle_id, &100);
+
+        let proposed_weights = ScoringWeights {
+            vc_weight: 50,
+            tx_weight: 20,
+            repayment_weight: 30,
+        };
+        let proposer = Address::generate(&env);
+        let voting_period = 100;
+        let execution_delay = 10;
+        let proposal_id = gov_client.create_proposal(
+            &proposer,
+            &proposed_weights,
+            &voting_period,
+            &execution_delay,
+        );
+
+        let voter_for = Address::generate(&env);
+        let voter_against = Address::generate(&env);
+        gov_client.register_voter(&admin, &voter_for, &40);
+        gov_client.register_voter(&admin, &voter_against, &60);
+        gov_client.vote(&voter_for, &proposal_id, &true, &40);
+        gov_client.vote(&voter_against, &proposal_id, &false, &60);
+
+        let proposal = gov_client.get_proposal(&proposal_id).unwrap();
+        assert_eq!(proposal.votes_for, 40);
+        assert_eq!(proposal.votes_against, 60);
+        assert_eq!(proposal.quorum_required, 100);
+        assert_eq!(proposal.votes_for + proposal.votes_against, 100);
+        assert!(!proposal.executed);
+
+        // Advance ledger past voting expiry + execution delay
+        env.ledger().with_mut(|l| {
+            l.sequence_number += voting_period + execution_delay + 1;
+        });
+
+        // Attempt execution: must be rejected because votes_against > votes_for
+        let res = gov_client.try_execute(&proposal_id);
+        assert_eq!(res, Err(Ok(GovernanceError::ProposalRejected)));
+
+        // Verify proposal state was not marked as executed
+        let proposal_after = gov_client.get_proposal(&proposal_id).unwrap();
+        assert!(
+            !proposal_after.executed,
+            "rejected proposal must not be marked as executed"
+        );
+    }
+
+    /// Issue #763: Proposals where `votes_for == votes_against` (tie) must fail
+    /// execution with `ProposalRejected`, even when total votes meet the required quorum (100).
+    #[test]
+    fn test_governance_tie_is_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let credit_oracle_id = env.register_contract(None, CreditOracle);
+        CreditOracleClient::new(&env, &credit_oracle_id).initialize(&admin);
+
+        let gov_id = env.register_contract(None, Governance);
+        let gov_client = GovernanceClient::new(&env, &gov_id);
+        gov_client.initialize(&admin, &credit_oracle_id, &100);
+
+        let proposed_weights = ScoringWeights {
+            vc_weight: 50,
+            tx_weight: 20,
+            repayment_weight: 30,
+        };
+        let proposer = Address::generate(&env);
+        let voting_period = 100;
+        let execution_delay = 10;
+        let proposal_id = gov_client.create_proposal(
+            &proposer,
+            &proposed_weights,
+            &voting_period,
+            &execution_delay,
+        );
+
+        let voter_for = Address::generate(&env);
+        let voter_against = Address::generate(&env);
+        gov_client.register_voter(&admin, &voter_for, &50);
+        gov_client.register_voter(&admin, &voter_against, &50);
+        gov_client.vote(&voter_for, &proposal_id, &true, &50);
+        gov_client.vote(&voter_against, &proposal_id, &false, &50);
+
+        let proposal = gov_client.get_proposal(&proposal_id).unwrap();
+        assert_eq!(proposal.votes_for, 50);
+        assert_eq!(proposal.votes_against, 50);
+        assert_eq!(proposal.quorum_required, 100);
+        assert_eq!(proposal.votes_for + proposal.votes_against, 100);
+        assert!(!proposal.executed);
+
+        // Advance ledger past voting expiry + execution delay
+        env.ledger().with_mut(|l| {
+            l.sequence_number += voting_period + execution_delay + 1;
+        });
+
+        // Attempt execution: must be rejected because votes_for == votes_against
+        let res = gov_client.try_execute(&proposal_id);
+        assert_eq!(res, Err(Ok(GovernanceError::ProposalRejected)));
+
+        // Verify proposal state was not marked as executed
+        let proposal_after = gov_client.get_proposal(&proposal_id).unwrap();
+        assert!(
+            !proposal_after.executed,
+            "tied proposal must not be marked as executed"
+        );
     }
 }

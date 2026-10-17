@@ -1045,6 +1045,30 @@ impl IdentityOracle {
         active
     }
 
+    /// Returns the VC hashes of revoked VC anchor records for `subject`.
+    ///
+    /// A record counts as revoked if it was locally marked via
+    /// `mark_vc_revoked` (which the revocation registry calls from
+    /// `revoke(issuer, subject, vc_hash)`) or if the linked revocation
+    /// registry reports its hash as revoked. Complements `get_vc_details`,
+    /// which returns only the active records.
+    pub fn list_revoked_for_subject(env: Env, subject: Address) -> Vec<BytesN<32>> {
+        let key = DataKey::VCAnchors(subject);
+        let anchors: Vec<VCRecord> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or(Vec::new(&env));
+
+        let mut revoked = Vec::new(&env);
+        for record in anchors.iter() {
+            if is_record_revoked(&env, &record) {
+                revoked.push_back(record.vc_hash);
+            }
+        }
+        revoked
+    }
+
     /// Returns the credential type label for an anchored VC, defaulting to `generic`.
     pub fn get_vc_credential_type(env: Env, subject: Address, vc_hash: BytesN<32>) -> Symbol {
         get_stored_credential_type(&env, &subject, &vc_hash)
@@ -1553,6 +1577,68 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn anchor_did_cid_validation_v0() {
+        // CIDv0: base58btc multihash, starts with "Qm", 46 chars total.
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, IdentityOracle);
+        let client = IdentityOracleClient::new(&env, &contract_id);
+
+        let subject = Address::generate(&env);
+        let cid = String::from_str(&env, "QmYwAPJzagoJzrKSTTkG8w6zWZSNxrCYhpDkxQottEwHym");
+        assert_eq!(cid.len(), 46);
+        client.anchor_did(&subject, &cid);
+        assert_eq!(client.get_did_document(&subject), Some(cid));
+    }
+
+    #[test]
+    fn anchor_did_cid_validation_v1() {
+        // CIDv1: multibase base32, starts with "bafy".
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, IdentityOracle);
+        let client = IdentityOracleClient::new(&env, &contract_id);
+
+        let subject = Address::generate(&env);
+        let cid = String::from_str(&env, "bafy2bzacedw4hc6k2vxtcmfmr3jtcl6yvqohqmvtqj7lhyzuejcxgxvl6yv4");
+        assert!(cid.len() <= MAX_CID_LENGTH);
+        client.anchor_did(&subject, &cid);
+        assert_eq!(client.get_did_document(&subject), Some(cid));
+    }
+
+    #[test]
+    fn anchor_did_cid_validation_invalid() {
+        // Strings that are not valid IPFS CIDs must be rejected.
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, IdentityOracle);
+        let client = IdentityOracleClient::new(&env, &contract_id);
+
+        let subject = Address::generate(&env);
+
+        // Empty string.
+        let empty = String::from_str(&env, "");
+        assert_eq!(
+            client.try_anchor_did(&subject, &empty),
+            Err(Ok(IdentityOracleError::InvalidCID))
+        );
+
+        // Wrong prefix (not "Qm", "bafy", or "ipfs://").
+        let bad_prefix = String::from_str(&env, "notacidvalue");
+        assert_eq!(
+            client.try_anchor_did(&subject, &bad_prefix),
+            Err(Ok(IdentityOracleError::InvalidCID))
+        );
+
+        // Arbitrary text that is neither a CID nor a valid prefix.
+        let gibberish = String::from_str(&env, "hello world");
+        assert_eq!(
+            client.try_anchor_did(&subject, &gibberish),
+            Err(Ok(IdentityOracleError::InvalidCID))
+        );
+    }
+
     fn test_anchor_did_accepts_valid_ipfs_cid() {
         let env = Env::default();
         env.mock_all_auths();
@@ -1914,6 +2000,36 @@ mod tests {
         client.mark_vc_revoked(&issuer, &subject, &vc_hash);
 
         assert!(!client.is_verified(&subject));
+    }
+
+    #[test]
+    fn test_list_revoked_for_subject() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, IdentityOracle);
+        let client = IdentityOracleClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let issuer = Address::generate(&env);
+        client.register_issuer(&issuer);
+
+        let subject = Address::generate(&env);
+        let hash1 = BytesN::from_array(&env, &[1u8; 32]);
+        let hash2 = BytesN::from_array(&env, &[2u8; 32]);
+        let hash3 = BytesN::from_array(&env, &[3u8; 32]);
+        client.anchor_vc(&issuer, &subject, &hash1);
+        client.anchor_vc(&issuer, &subject, &hash2);
+        client.anchor_vc(&issuer, &subject, &hash3);
+
+        assert_eq!(client.list_revoked_for_subject(&subject).len(), 0);
+
+        client.mark_vc_revoked(&issuer, &subject, &hash2);
+
+        let revoked = client.list_revoked_for_subject(&subject);
+        assert_eq!(revoked.len(), 1);
+        assert_eq!(revoked.get(0).unwrap(), hash2);
     }
 
     #[test]
