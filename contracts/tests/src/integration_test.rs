@@ -2361,8 +2361,6 @@ mod tests {
         credit.flag_score_input(&subject, &key_tx, &reason);
         credit.flag_score_input(&subject, &key_repay, &reason);
 
-        let _ = env.events().all();
-
         credit.resolve_dispute(&subject, &key_tx, &true);
         credit.resolve_dispute(&subject, &key_repay, &false);
 
@@ -2371,8 +2369,7 @@ mod tests {
         let mut rslv_payloads: Vec<(soroban_sdk::Address, soroban_sdk::Symbol)> = Vec::new();
         let mut rjct_payloads: Vec<(soroban_sdk::Address, soroban_sdk::Symbol)> = Vec::new();
 
-        for i in 0..events.len() {
-            let (emitter, topics, data) = events.get(i).unwrap();
+        for (emitter, topics, data) in events.iter() {
             if emitter != credit_id || topics.is_empty() {
                 continue;
             }
@@ -2385,11 +2382,13 @@ mod tests {
 
             if topic0 == symbol_short!("DsptRslv") {
                 let payload: (soroban_sdk::Address, soroban_sdk::Symbol) = data
+                    .clone()
                     .try_into_val(&env)
                     .expect("DsptRslv data must be (Address, Symbol)");
                 rslv_payloads.push(payload);
             } else if topic0 == symbol_short!("DsptRjct") {
                 let payload: (soroban_sdk::Address, soroban_sdk::Symbol) = data
+                    .clone()
                     .try_into_val(&env)
                     .expect("DsptRjct data must be (Address, Symbol)");
                 rjct_payloads.push(payload);
