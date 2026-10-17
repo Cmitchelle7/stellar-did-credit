@@ -1948,7 +1948,7 @@ mod tests {
         assert_eq!(version_idempotent, Some(2u32));
     }
 
-    // ── Compute-score cooldown tests ──────────────────────────────────────
+    // -- Compute-score cooldown tests --------------------------------------
 
     /// cooldown = 1 (default): second call within the same ledger is rejected.
     #[test]
@@ -2630,7 +2630,7 @@ mod tests {
         assert_eq!(credit.compute_score(&subject), baseline);
     }
 
-    /// Full cross-contract integration test for the governance → credit-oracle
+    /// Full cross-contract integration test for the governance -> credit-oracle
     /// weight update flow. Deploys all four contracts, transfers credit-oracle
     /// admin to governance, creates a weight-change proposal, votes, executes
     /// (which calls propose_weights on credit-oracle), advances past the
@@ -2700,7 +2700,7 @@ mod tests {
             l.sequence_number += 101;
         });
 
-        // 8. Execute proposal — calls propose_weights on credit-oracle
+        // 8. Execute proposal - calls propose_weights on credit-oracle
         gov.execute(&proposal_id);
 
         let proposal = gov.get_proposal(&proposal_id).unwrap();
@@ -2749,6 +2749,3 @@ mod tests {
         assert_eq!(active_weights.repayment_weight, 30);
     }
 }
-
-
-    }
