@@ -2323,7 +2323,7 @@ mod tests {
     // -----------------------------------------------------------------------
     #[test]
     fn test_dispute_resolve_and_reject_emit_correctly_payloaded_events() {
-        use soroban_sdk::{symbol_short, IntoVal, TryIntoVal};
+        use soroban_sdk::{symbol_short, TryIntoVal};
 
         let env = Env::default();
         env.mock_all_auths();
@@ -2340,7 +2340,6 @@ mod tests {
         credit.register_feeder(&admin, &feeder);
         credit.register_lender(&admin, &lender);
 
-        // Baseline data so the score is well-formed.
         credit.update_tx_stats(
             &feeder,
             &subject,
@@ -2355,7 +2354,6 @@ mod tests {
         }
         let _ = credit.compute_score(&subject);
 
-        // Two independent disputes on the same subject.
         let key_tx = soroban_sdk::Symbol::new(&env, "tx_stats");
         let key_repay = soroban_sdk::Symbol::new(&env, "repayment");
         let reason = soroban_sdk::String::from_str(&env, "disputed input");
@@ -2363,19 +2361,15 @@ mod tests {
         credit.flag_score_input(&subject, &key_tx, &reason);
         credit.flag_score_input(&subject, &key_repay, &reason);
 
-        // Capture the ledger boundary before either resolution so the
-        // assertion only looks at events emitted by the two calls below.
         let events_before = env.events().all().len();
 
-        // Accept tx_stats, reject repayment.
         credit.resolve_dispute(&subject, &key_tx, &true);
         credit.resolve_dispute(&subject, &key_repay, &false);
 
-        // -- Assert on the events produced by the two resolve calls ---------
         let events = env.events().all();
 
-        let mut rslv_payloads: Vec<(soroban_sdk::Address, soroban_sdk::Symbol)> = Vec::new(&env);
-        let mut rjct_payloads: Vec<(soroban_sdk::Address, soroban_sdk::Symbol)> = Vec::new(&env);
+        let mut rslv_payloads: Vec<(soroban_sdk::Address, soroban_sdk::Symbol)> = Vec::new();
+        let mut rjct_payloads: Vec<(soroban_sdk::Address, soroban_sdk::Symbol)> = Vec::new();
 
         for i in events_before..events.len() {
             let (emitter, topics, data) = events.get(i).unwrap();
@@ -2393,34 +2387,31 @@ mod tests {
                 let payload: (soroban_sdk::Address, soroban_sdk::Symbol) = data
                     .try_into_val(&env)
                     .expect("DsptRslv data must be (Address, Symbol)");
-                rslv_payloads.push_back(payload);
+                rslv_payloads.push(payload);
             } else if topic0 == symbol_short!("DsptRjct") {
                 let payload: (soroban_sdk::Address, soroban_sdk::Symbol) = data
                     .try_into_val(&env)
                     .expect("DsptRjct data must be (Address, Symbol)");
-                rjct_payloads.push_back(payload);
+                rjct_payloads.push(payload);
             }
         }
 
-        // Exactly one of each, with the payloads a feeder would match on.
         assert_eq!(rslv_payloads.len(), 1, "expected exactly one DsptRslv");
         assert_eq!(rjct_payloads.len(), 1, "expected exactly one DsptRjct");
 
-        let (rslv_subject, rslv_key) = rslv_payloads.get(0).unwrap();
-        assert_eq!(rslv_subject, subject, "DsptRslv subject mismatch");
-        assert_eq!(rslv_key, key_tx, "DsptRslv input_key must be tx_stats");
+        let (rslv_subject, rslv_key) = &rslv_payloads[0];
+        assert_eq!(rslv_subject, &subject, "DsptRslv subject mismatch");
+        assert_eq!(rslv_key, &key_tx, "DsptRslv input_key must be tx_stats");
 
-        let (rjct_subject, rjct_key) = rjct_payloads.get(0).unwrap();
-        assert_eq!(rjct_subject, subject, "DsptRjct subject mismatch");
-        assert_eq!(rjct_key, key_repay, "DsptRjct input_key must be repayment");
+        let (rjct_subject, rjct_key) = &rjct_payloads[0];
+        assert_eq!(rjct_subject, &subject, "DsptRjct subject mismatch");
+        assert_eq!(rjct_key, &key_repay, "DsptRjct input_key must be repayment");
 
-        // On-chain state reflects the two independent resolutions.
         let tx_dispute = credit.get_dispute(&subject, &key_tx).unwrap();
         assert_eq!(tx_dispute.status, DisputeStatus::Resolved);
         let repay_dispute = credit.get_dispute(&subject, &key_repay).unwrap();
         assert_eq!(repay_dispute.status, DisputeStatus::Rejected);
     }
-
 
     /// Verifies that persistent storage entries (DID document, VC anchors, revocation status)
     /// survive a simulated ledger advance of 200,000 ledgers (> initial unextended threshold).
